@@ -1,5 +1,7 @@
 # Tail —— 传输层 KV Cache 优化系统
 
+> 📖 English: [README.en.md](./README.en.md)
+>
 > **Tail** — *Send the tail, the head is cached.*
 > **头部已缓存,只发尾部。**
 >
