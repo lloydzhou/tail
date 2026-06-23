@@ -1,20 +1,24 @@
 [project]
-name = "kv-cache-gateway"
-version = "1.0.0"
-description = "传输层 KV Cache 优化系统:在客户端 SDK 与 API 网关之间引入前缀缓存协商层,透明节省 OpenAI Chat Completions 上行带宽。"
+name = "tail"
+version = "2.1.0"
+description = "Tail — Send the tail, the head is cached. 传输层 KV Cache 优化:openai SDK monkey patch + OpenResty/Kvrocks 网关,透明节省 LLM 上行带宽。"
 readme = "README.md"
 requires-python = ">=3.10"
-authors = [{ name = "架构组" }]
+authors = [{ name = "lloydzhou" }]
 license = { text = "MIT" }
 dependencies = [
-    "fastapi>=0.110",
-    "httpx>=0.27",
-    "tiktoken>=0.7",
-    "uvicorn>=0.27",
+    "openai>=1.0",
 ]
 
 [project.optional-dependencies]
-test = ["pytest>=8.0", "pytest-asyncio>=0.23"]
+test = [
+    "pytest>=8.0",
+    "pytest-asyncio>=0.23",
+    "httpx>=0.27",
+    "fastapi>=0.110",
+    "uvicorn>=0.27",
+    "redis>=5.0",
+]
 
 [build-system]
 requires = ["setuptools>=68"]

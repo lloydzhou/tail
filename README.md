@@ -10,12 +10,9 @@
 > 引入前缀缓存协商层,以「乐观发送 + 自动降级」策略,透明节省 OpenAI Chat Completions
 > 接口的公网上行带宽,对后端推理服务完全无侵。
 
-本仓库包含**两条实现路径**:
-
-| 路径 | 技术栈 | 作用 |
-|------|--------|------|
-| **生产版**(主) | OpenResty/Lua 网关 + **Kvrocks(硬盘)**缓存 + openai SDK monkey patch | 贴近设计文档第 5 章的生产形态 |
-| **参考版**(辅) | 纯 Python(FastAPI 网关 + KvrocksStore/内存 store + SDK) | 协议逻辑的可读参考实现 |
+两个组件:
+- **客户端**:`tail/openai_patch.py` —— openai 官方 SDK 的 monkey patch(零改动)
+- **服务端**:`openresty/lua/kvcache/` —— OpenResty/Lua 网关 + Kvrocks(硬盘)缓存
 
 ---
 
@@ -100,7 +97,7 @@ run.sh                     # 一键启停(Kvrocks + 网关 + 模拟后端)
 ### 4.1 一键启动
 
 ```bash
-cd /home/lloyd/ZCodeProject
+cd tail   # clone 后进入项目根
 ./run.sh start      # 起 Kvrocks(6666)+ 网关(8765)+ 模拟后端(8080)
 ./run.sh status     # 查看各服务状态
 ./run.sh stop       # 停全部
@@ -125,11 +122,14 @@ client.chat.completions.create(
 ### 4.3 跑测试
 
 ```bash
-# Lua 单测
+# Lua 单测(只需 OpenResty)
 ./openresty/run_lua_tests.sh
 
-# Python 全套测试
-python3 -m pytest tests/ -v
+# patch 单测(纯 Python,无需服务)
+python3 -m pytest tests/test_openai_patch.py -v
+
+# OpenResty 端到端(需先 ./run.sh start 起 Kvrocks+网关+后端)
+python3 -m pytest tests/test_openresty_e2e.py -v
 ```
 
 ---
@@ -192,8 +192,6 @@ Kvrocks 真写入 / ★ reload 后仍命中(硬盘持久) / 大前缀 /
 - 补 `zlib_with_headers` 别名 target(系统库改造后的链接需求)。
 
 ---
-
-## 8. 模块对应关系(对照设计文档)
 
 ## 8. 组件对应关系(对照设计文档)
 

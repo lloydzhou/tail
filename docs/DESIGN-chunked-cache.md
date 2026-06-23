@@ -477,7 +477,7 @@ SDK 不解析内部结构。
 - `openresty/lua/kvcache/segment.lua` —— segment 切分(§3.1)
 - `openresty/lua/kvcache/merkle.lua` —— Merkle 链(§3.4)
 - `openresty/lua/kvcache/chunked_store.lua` —— 分段存储(§5)
-- `tail/segment.py` / `tail/merkle.py` / `tail/chunked_store.py` —— Python 参考版
+- (Python 参考版 segment/merkle/chunked_store 已从仓库移除,算法见本设计文档 §3)
 - 网关 `gateway.lua`:access/log 分支(检测 `::` 走 v2.1)
 - 测试重点:(a) segment 切分覆盖所有合法形态;(b) 加一段只增 O(1);(c) 还原字节级一致;(d) 跨对话 segment 复用
 
