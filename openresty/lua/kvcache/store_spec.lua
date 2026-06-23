@@ -9,6 +9,7 @@ end
 
 -- 内存表模拟 Kvrocks,每次 store.connect 会创建一个新实例但共享同一个 kv
 local kv = {}
+local renew_log = {}   -- 记录 expire 续期调用:{[key]=ttl},供续期测试断言
 
 local function make_mock_redis()
     local obj = {}
@@ -22,6 +23,11 @@ local function make_mock_redis()
     function obj:get(k)
         if kv[k] == nil then return ngx.null end
         return kv[k]
+    end
+    function obj:expire(k, ttl)
+        -- 记录续期调用到模块级表,便于测试断言"读后被续期"
+        renew_log[k] = ttl
+        return 1
     end
     function obj:del(k)
         local existed = kv[k] ~= nil
@@ -46,6 +52,7 @@ local cfg = {
     max_prefix_bytes = 8 * 1024 * 1024,
     hash_ns = "prefix_cache",
     kvrocks_host = "127.0.0.1", kvrocks_port = 6666,
+    renew_ttl = 1800,
 }
 local now = ngx and ngx.time() or os.time()
 
@@ -108,6 +115,17 @@ check("过期 entry get 返回 nil", got7 == nil)
 -- 8. 命中后内容是深拷贝语义(mock 直接存引用,但 store 不修改返回值)
 local got8 = store.get(cfg, "h2")
 check("命中 entry 含 expire_at", got8 and got8.expire_at ~= nil)
+
+-- 9. 访问驱动续期(§7.4):get 命中后应调用 expire 续期
+renew_log = {}                          -- 清空续期日志
+store.get(cfg, "h2")                    -- 命中读取
+check("get 命中后触发 expire 续期", renew_log["prefix_cache:h2"] ~= nil)
+check("续期 TTL = cfg.renew_ttl(1800)", renew_log["prefix_cache:h2"] == 1800)
+
+-- 10. miss 不续期(不存在的 key 不该续期)
+renew_log = {}
+store.get(cfg, "definitely_missing_key")
+check("miss 不触发续期", renew_log["prefix_cache:definitely_missing_key"] == nil)
 
 print(("\n总计: %d 通过, %d 失败"):format(pass, fail))
 if fail > 0 then os.exit(1) end

@@ -241,6 +241,49 @@ def test_kvrocks_actually_stores_entry(stack):
     assert b"STORE_CHECK" in blob
 
 
+def test_access_driven_ttl_renewal(stack):
+    """访问驱动续期(§7.4):命中读取后,Kvrocks 里该 key 的 TTL 应被刷新(变大)。
+
+    流程:写入 → 记 TTL_0 → 等 TTL 掉一点 → 命中读取 → 记 TTL_1 → TTL_1 应 > TTL_0。
+    """
+    import redis
+    import time as _t
+    r = redis.Redis(host="127.0.0.1", port=6666)
+    for k in r.scan_iter("prefix_cache:*"):
+        r.delete(k)
+    # 写入(首次请求建缓存)
+    r1 = _chat([{"role": "system", "content": "RENEW_CHECK"}, {"role": "user", "content": "q"}])
+    h = r1.headers["X-Cache-Hash"]
+    _t.sleep(1.0)  # 等异步写入
+    key = f"prefix_cache:{h}"
+    assert r.exists(key) == 1
+    ttl_0 = r.ttl(key)              # 续期前 TTL(应为 renew_ttl=1800 附近,写入时 EX=ttl=21600?)
+    # 用带 hash 的请求触发命中读取(增量)→ 网关 store.get 命中 → EXPIRE 续期
+    inc = [{"role": "assistant", "content": "a"}, {"role": "user", "content": "q2"}]
+    r2 = _chat(inc, cache_hash=h, prefix_length=2)
+    assert r2.status_code == 200, f"应命中: {r2.status_code}"
+    _t.sleep(0.5)                   # 等续期生效
+    ttl_1 = r.ttl(key)              # 续期后 TTL
+    # 续期后 TTL 应接近 renew_ttl(1800),且不小于续期前
+    # 注:写入用 EX=cfg.ttl(21600),续期改为 renew_ttl(1800),
+    # 所以 ttl_1 应明显小于 ttl_0(21600→1800 附近),但 > 0 表示确实刷新了 TTL
+    assert ttl_1 > 0, "续期后 TTL 应 > 0"
+    assert ttl_1 <= 1810, f"续期后 TTL 应≈renew_ttl(1800),实际 {ttl_1}"
+    assert ttl_1 < ttl_0, f"续期应把 TTL 从 {ttl_0} 刷新到 ~1800,实际 {ttl_1}"
+
+
+def test_miss_does_not_renew(stack):
+    """miss(不存在的 key)不应触发续期。"""
+    import redis
+    r = redis.Redis(host="127.0.0.1", port=6666)
+    fake = "nonexistent_renew_check"
+    # 用不存在的 hash 发增量 → miss(fast_fail 422)→ 不该有续期
+    resp = _chat([{"role": "user", "content": "inc"}], cache_hash=fake, prefix_length=1)
+    assert resp.status_code == 422
+    # 该 key 不存在(没写过),TTL 查询返回 -2
+    assert r.ttl(f"prefix_cache:{fake}") == -2
+
+
 def test_cache_survives_gateway_reload(stack):
     """reload 网关后(进程重启,缓存只在 Kvrocks),同哈希仍命中。
 

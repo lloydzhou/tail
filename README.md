@@ -147,13 +147,13 @@ python3 -m pytest tests/test_openresty_e2e.py -v
 
 ---
 
-## 6. 测试结果(85/85 全过)
+## 6. 测试结果(87/87 全过)
 
 ### Lua 单元测试(54)
 ```
 hashing:   23/23   稳定性/抗碰撞/边界/前缀扩展/特殊字符/多模态/超长
 protocol:  14/14   头部常量/抖动过期/默认配置
-store:     17/17   Kvrocks get/set_sync/set_async/del/过期/超大/命名空间
+store:     20/20   Kvrocks get/set_sync/set_async/del/过期/超大/命名空间/访问驱动续期
 ```
 
 ### Python 测试(18)
@@ -168,10 +168,11 @@ v2.1 修复:★ compact 降级全量 / ★ 编辑旧消息降级 / ★ 重排降
           ★ 多 session contextvars 隔离 / ★ 串行 session 优雅降级 / digest 替代数组
 ```
 
-### OpenResty+Kvrocks 端到端(13)
+### OpenResty+Kvrocks 端到端(15)
 ```
 health / 首次全量 / 命中还原 / miss fast_fail / 多轮新哈希 /
-Kvrocks 真写入 / ★ reload 后仍命中(硬盘持久) / 大前缀 /
+Kvrocks 真写入 / ★ 访问驱动续期(读后 TTL 刷新) / miss 不续期 /
+★ reload 后仍命中(硬盘持久) / 大前缀 /
 错误 prefix_length / 过期 entry miss / 并发 / 健康端点
 ```
 

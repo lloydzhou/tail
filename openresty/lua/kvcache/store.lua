@@ -36,6 +36,13 @@ function M.get(cfg, hash)
     if not red then return nil, "connect_fail:" .. tostring(err) end
     local key = cfg.hash_ns .. ":" .. hash
     local blob = red:get(key)
+    -- 访问驱动续期(§7.4):命中则在归还连接前刷新 TTL,活跃链不过期。
+    -- 续期失败不影响本次读取(降级为不续期)。
+    if blob ~= nil and blob ~= ngx.null then
+        pcall(function()
+            red:expire(key, cfg.renew_ttl or 1800)
+        end)
+    end
     red:set_keepalive(10000, 100)
     if blob == nil or blob == ngx.null then
         return nil, "miss"

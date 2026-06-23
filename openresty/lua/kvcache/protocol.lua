@@ -15,6 +15,7 @@ M.DEFAULT_CACHE_TTL = 6 * 3600           -- 秒,与服务端 KV Cache 对齐(数
 M.DEFAULT_TTL_JITTER = 600               -- ±秒,防雪崩
 M.DEFAULT_MAX_PREFIX_BYTES = 8 * 1024 * 1024  -- 单条前缀上限 8MB,防滥用
 M.DEFAULT_HASH_NS = "prefix_cache"        -- Kvrocks key 前缀
+M.DEFAULT_RENEW_TTL = 30 * 60             -- 访问驱动续期 TTL(秒),见 §7.4
 
 -- 缓存未命中处理模式
 M.MISS_FAST_FAIL = "fast_fail"            -- 默认:不转发,返回 422 由 SDK 重试
@@ -45,6 +46,7 @@ function M.get_config()
         miss_mode         = var.kvcache_miss_mode or M.MISS_FAST_FAIL,
         kvrocks_host      = var.kvcache_kvrocks_host or "127.0.0.1",
         kvrocks_port      = tonumber(var.kvcache_kvrocks_port) or 6666,
+        renew_ttl         = tonumber(var.kvcache_renew_ttl) or M.DEFAULT_RENEW_TTL,
     }
 end
 
