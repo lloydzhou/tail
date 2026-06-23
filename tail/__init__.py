@@ -1,39 +1,25 @@
-"""传输层 KV Cache 优化系统 —— 参考实现。
+"""Tail —— 传输层 KV Cache 优化系统。
 
-对应设计文档《传输层KV Cache优化系统设计文档 v1.0》。
+两个核心组件:
+  - openai_patch:  openai 官方 SDK 的 monkey patch(客户端,用户直接用)
+  - protocol:      协议头常量(供参考,patch 内部已自包含)
 
-组件:
-  - protocol:  协议头常量与缓存策略(第 4、9 章)
-  - hashing:   基于前缀 Token 序列的 SHA256 哈希(第 5.2 节)
-  - tokenizer: tiktoken 分词器封装(第 5.2、Phase 1)
-  - store:     LRU + TTL 前缀缓存存储(第 5.1 节)
-  - gateway:   OpenAI 兼容网关(协商核心,第 3、5 章)
-  - sdk:       带缓存协商的客户端 SDK(第 6 章)
-  - backend:   模拟推理服务(测试/演示用,第 3 章「推理服务」)
+辅助算法库(供参考 / 未来移植 Lua 用):
+  - hashing:   前缀哈希(token 版 + 字符串版)
+  - segment:   按 LLM 回合切分 messages(m·n=0 约束)
+  - merkle:    Merkle 前缀链(增量 hash)
+
+服务端实现见 openresty/lua/kvcache/(OpenResty + Kvrocks)。
 """
 
-from . import protocol
-from .backend import build_backend_app
-from .gateway import build_app
-from .hashing import compute_prefix_hash
-from .sdk import AsyncCachedClient, CachedClient
-from . import openai_patch
-from .store import CacheEntry, PrefixCacheStore
-from .kvrocks_store import KvrocksStore
-from .chunked_store import ChunkedStore
-from .tokenizer import Tokenizer
+from . import openai_patch, protocol
+from .hashing import compute_prefix_hash, messages_hash
 
 __all__ = [
+    "openai_patch",
     "protocol",
-    "build_app",
-    "build_backend_app",
-    "CachedClient",
-    "AsyncCachedClient",
-    "PrefixCacheStore",
-    "KvrocksStore",
-    "CacheEntry",
-    "Tokenizer",
     "compute_prefix_hash",
+    "messages_hash",
 ]
 
-__version__ = "1.0.0"
+__version__ = "2.1.0"

@@ -83,6 +83,6 @@ def build_backend_app() -> FastAPI:
 def app_factory() -> FastAPI:
     """uvicorn --factory 入口(run.sh 用)。
 
-    用法: ``uvicorn tail.backend:app_factory --factory --port 8080``
+    用法: ``uvicorn tests.mock_backend:app_factory --factory --port 8080``
     """
     return build_backend_app()

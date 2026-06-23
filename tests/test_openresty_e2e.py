@@ -70,7 +70,7 @@ def stack():
     # 1) 启动 mock backend(uvicorn)
     env = dict(os.environ)
     backend = subprocess.Popen(
-        ["python3", "-m", "uvicorn", "tail.backend:app_factory",
+        ["python3", "-m", "uvicorn", "tests.mock_backend:app_factory",
          "--factory", "--host", "127.0.0.1", "--port", "8080"],
         cwd=str(PROJECT), env=env,
         stdout=open(LOG_DIR / "e2e_backend.log", "wb"),

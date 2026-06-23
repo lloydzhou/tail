@@ -50,19 +50,14 @@ OpenResty 三阶段(对应设计文档第 5.3 节):
 ## 2. 目录结构
 
 ```
-tail/                      # Python 参考实现
-├── gateway.py             # FastAPI 网关(协商核心)
-├── sdk.py                 # 同步/异步客户端 SDK
-├── openai_patch.py        # openai 官方 SDK monkey patch(含 v2.1 指纹校验+session 隔离)
-├── kvrocks_store.py       # Kvrocks 缓存后端 v1.0(Redis 协议,硬盘)
-├── chunked_store.py       # v2.1 分层 Segment-Merkle 缓存(三段+增量链)
-├── segment.py             # v2.1 segment 切分(m·n=0 约束)
-├── merkle.py              # v2.1 Merkle 前缀链
-├── store.py               # 纯内存 store(无 Kvrocks 环境的回退)
-├── protocol.py / hashing.py / tokenizer.py / backend.py
-docs/
-└── DESIGN-chunked-cache.md # v2.1 设计文档(分层 Segment-Merkle + SDK 一致性)
-openresty/                 # 生产版 OpenResty 网关
+tail/                      # 客户端:openai 官方 SDK monkey patch + 辅助算法
+├── openai_patch.py        # ★ 核心:openai SDK monkey patch(指纹校验 + session 隔离 + 自动重试)
+├── protocol.py            # 协议头常量(参考)
+├── hashing.py             # 前缀哈希(token 版 + 字符串版)
+├── segment.py             # segment 切分(m·n=0 约束,供参考/移植)
+├── merkle.py              # Merkle 前缀链(增量 hash,供参考/移植)
+└── backend.py             # 模拟推理服务(测试夹具,e2e 用)
+openresty/                 # ★ 服务端:OpenResty/Lua 网关 + Kvrocks 硬盘缓存
 ├── conf/nginx.conf        # 网关配置(access/header_filter/log 三阶段挂 Lua)
 ├── conf/kvrocks.conf      # Kvrocks 配置(端口 6666,数据落盘)
 ├── lua/kvcache/
@@ -73,11 +68,12 @@ openresty/                 # 生产版 OpenResty 网关
 │   ├── hashing_spec.lua / protocol_spec.lua / store_spec.lua   # Lua 单测
 ├── run_lua_tests.sh       # 统一 Lua 单测 runner
 └── logs/
-runtime/                   # 本地编译的运行时
+runtime/                   # 本地编译的运行时(gitignore,需自己 build)
 ├── openresty/             # OpenResty 1.27 + LuaJIT
 └── kvrocks/bin/kvrocks    # Kvrocks 2.16.0
-tests/                     # 测试(共 133 个,分层)
-examples/demo.py           # 参考版端到端演示
+tests/                     # 测试(patch 单测 + OpenResty 端到端)
+docs/
+└── DESIGN-chunked-cache.md # v2.1 设计文档(分层 Segment-Merkle + SDK 一致性)
 run.sh                     # 一键启停(Kvrocks + 网关 + 模拟后端)
 ```
 
@@ -158,7 +154,7 @@ python3 -m pytest tests/ -v
 
 ---
 
-## 6. 测试结果(174/174 全过)
+## 6. 测试结果(113/113 全过)
 
 ### Lua 单元测试(54)
 ```
@@ -167,14 +163,12 @@ protocol:  14/14   头部常量/抖动过期/默认配置
 store:     17/17   Kvrocks get/set_sync/set_async/del/过期/超大/命名空间
 ```
 
-### Python 单元测试(107)
+### Python 测试(46)
 ```
-test_hashing / test_protocol / test_tokenizer / test_store       基础单元
-test_kvrocks_store (13)   v1.0 Kvrocks 后端 roundtrip/TTL/容错/并发
-test_segment (16)         v2.1 segment 切分:基础形态/m·n=0/工具回合/streaming 边缘/展平一致
-test_chunked_store (18)   v2.1 三段缓存:roundtrip/缺失段/增量 extend/跨对话复用/链断裂降级
-test_gateway / test_sdk   参考版网关与 SDK 端到端
-test_openai_patch (18)    monkey patch + v2.1 SDK 一致性修复
+test_hashing (7)          哈希稳定性/抗碰撞/边界
+test_protocol (5)         协议头常量/抖动过期
+test_segment (16)         segment 切分:基础形态/m·n=0/工具回合/streaming 边缘/展平一致
+test_openai_patch (18)    monkey patch + v2.1 SDK 一致性(见下)
 ```
 
 ### monkey patch 测试(18,含 v2.1 SDK 一致性)
@@ -209,12 +203,17 @@ Kvrocks 真写入 / ★ reload 后仍命中(硬盘持久) / 大前缀 /
 
 ## 8. 模块对应关系(对照设计文档)
 
-| Python 参考实现               | OpenResty 生产版 (Lua)                              | 设计文档章节 |
+## 8. 组件对应关系(对照设计文档)
+
+| 组件                          | 位置                                                | 设计文档章节 |
 |-------------------------------|-----------------------------------------------------|--------------|
-| `gateway.py`                  | `access_by_lua` + `header_filter_by_lua` + `log_by_lua` | 第 5.3 节    |
-| `kvrocks_store.py`            | `lua/kvcache/store.lua`(直连 Kvrocks)             | 第 5.1 节    |
-| `hashing.py`                  | `lua/kvcache/hashing.lua`                           | 第 5.2 节    |
-| `openai_patch.py`             | openai 官方 SDK monkey patch(透明)                | 第 6 章      |
+| **服务端 网关**               | `openresty/lua/kvcache/gateway.lua`                 | 第 5.3 节    |
+| └ access/header_filter/log    | nginx.conf 三阶段                                   | 第 5.3 节    |
+| **服务端 缓存**               | `openresty/lua/kvcache/store.lua`(直连 Kvrocks)   | 第 5.1 节    |
+| **服务端 哈希**               | `openresty/lua/kvcache/hashing.lua`                 | 第 5.2 节    |
+| **客户端 monkey patch**       | `tail/openai_patch.py`(透明,零改动)              | 第 6 章      |
+| 辅助:协议常量                | `tail/protocol.py` / `lua/kvcache/protocol.lua`     | 第 4 章      |
+| 辅助:segment/merkle 算法     | `tail/segment.py` / `tail/merkle.py`(供参考/移植)| v2.1 §3      |
 
 ---
 

@@ -60,7 +60,7 @@ start_backend() {
         return
     fi
     log "启动 Python 模拟后端 (端口 8080)..."
-    nohup python3 -m uvicorn tail.backend:app_factory --factory \
+    nohup python3 -m uvicorn tests.mock_backend:app_factory --factory \
         --host 127.0.0.1 --port 8080 > "$LOG_DIR/backend.log" 2>&1 &
     echo $! > "$BE_PID"
     sleep 1
