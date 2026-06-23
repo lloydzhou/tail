@@ -15,7 +15,7 @@ from typing import Optional
 
 import httpx
 from fastapi import FastAPI, Request
-from fastapi.responses import JSONResponse, Response
+from fastapi.responses import JSONResponse, StreamingResponse
 
 from . import protocol
 from .protocol import (
@@ -92,30 +92,13 @@ def build_app(cfg: protocol.GatewayConfig, storage: Storage,
                 if cfg.miss_mode != MISS_PASSTHROUGH:
                     return _fast_fail(cfg)
 
-        # ---- 4. 转发后端 ----
-        # 构造转发 header:剥离内部缓存协商 header
+        # ---- 4. 透明代理转发(streaming 友好:用 stream 边收边发,不缓冲)----
         fwd_headers = {
             k: v for k, v in request.headers.items()
             if k.lower() not in (HEADER_CACHE_HASH.lower(),
                                  HEADER_CACHE_PREFIX_LENGTH.lower())
         }
-        try:
-            client_kwargs = {"timeout": httpx.Timeout(60.0)}
-            if request.app.state.backend_transport is not None:
-                client_kwargs["transport"] = request.app.state.backend_transport
-            async with httpx.AsyncClient(**client_kwargs) as client:
-                upstream = await client.post(
-                    f"{cfg.backend_url}/v1/chat/completions",
-                    json=body if body else {},
-                    headers=fwd_headers,
-                )
-        except Exception as e:
-            logger.exception("upstream forward failed")
-            return JSONResponse(status_code=502,
-                                content={"error": {"message": f"upstream unavailable: {e}"}})
-
-        # ---- 5. 计算新 cache_key + 异步写(等价 header_filter + log_phase)----
-        new_cache_key = ""
+        # 预算 cache_key(header_filter 等价,纯算无需网络)
         expire = protocol.compute_expire(cfg.ttl, cfg.jitter)
         request_snapshot = {
             "system": system_val,
@@ -126,9 +109,27 @@ def build_app(cfg: protocol.GatewayConfig, storage: Storage,
             new_cache_key = storage.compute_cache_key(request_snapshot)
         except Exception:
             logger.exception("compute_cache_key failed")
+            new_cache_key = ""
 
-        # 异步写(后端 2xx 才写)
-        if upstream.status_code >= 200 and upstream.status_code < 300:
+        client_kwargs: dict = {"timeout": httpx.Timeout(60.0)}
+        if request.app.state.backend_transport is not None:
+            client_kwargs["transport"] = request.app.state.backend_transport
+
+        try:
+            # stream=True:不缓冲整个响应,SSE 字节流逐块透传
+            client = httpx.AsyncClient(**client_kwargs)
+            req = client.build_request(
+                "POST", f"{cfg.backend_url}/v1/chat/completions",
+                json=body if body else {}, headers=fwd_headers)
+            upstream = await client.send(req, stream=True)
+        except Exception as e:
+            logger.exception("upstream forward failed")
+            await client.aclose()
+            return JSONResponse(status_code=502,
+                                content={"error": {"message": f"upstream unavailable: {e}"}})
+
+        # ---- 5. 异步写缓存(log_phase 等价;后端 2xx 才写)----
+        if 200 <= upstream.status_code < 300:
             async def _write():
                 try:
                     storage.put_request(request_snapshot, expire)
@@ -137,21 +138,33 @@ def build_app(cfg: protocol.GatewayConfig, storage: Storage,
             try:
                 asyncio.get_running_loop().create_task(_write())
             except RuntimeError:
-                pass  # 无事件循环,跳过
+                pass
 
-        # ---- 6. 返回响应 + 注入缓存头 ----
+        # ---- 6. 透明代理响应 + 注入缓存头 ----
+        # 响应头:后端原样透传(text/event-stream 等保留)+ 追加 X-Cache-*
+        # 剥离 hop-by-hop 头(否则客户端/代理混乱)
+        skip = {"content-encoding", "transfer-encoding", "content-length", "connection"}
         resp_headers = {
-            HEADER_RESP_CACHE_HASH: new_cache_key,
-            HEADER_RESP_CACHE_EXPIRE: str(expire),
-            HEADER_RESP_CACHE_HIT: "true" if hit else "false",
+            k: v for k, v in upstream.headers.items() if k.lower() not in skip
         }
-        # 保留后端响应的 content-type
-        ct = upstream.headers.get("content-type")
-        return Response(
-            content=upstream.content,
+        resp_headers[HEADER_RESP_CACHE_HASH] = new_cache_key
+        resp_headers[HEADER_RESP_CACHE_EXPIRE] = str(expire)
+        resp_headers[HEADER_RESP_CACHE_HIT] = "true" if hit else "false"
+
+        async def stream_bytes():
+            """逐块透传后端字节流(SSE 边收边发)。结束后关闭 client。"""
+            try:
+                async for chunk in upstream.aiter_raw():
+                    yield chunk
+            finally:
+                await upstream.aclose()
+                await client.aclose()
+
+        return StreamingResponse(
+            stream_bytes(),
             status_code=upstream.status_code,
             headers=resp_headers,
-            media_type=ct,
+            media_type=upstream.headers.get("content-type"),
         )
 
     @app.get("/__tail/health")
