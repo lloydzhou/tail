@@ -12,9 +12,11 @@
 > 引入前缀缓存协商层,以「乐观发送 + 自动降级」策略,透明节省 OpenAI Chat Completions
 > 接口的公网上行带宽,对后端推理服务完全无侵。
 
-两个组件:
+两个组件(服务端可选 Python 或 OpenResty,二者 cache_key 逐字节一致、可互换):
 - **客户端**:`tail/openai_patch.py` —— openai 官方 SDK 的 monkey patch(零改动)
-- **服务端**:`openresty/lua/kvcache/` —— OpenResty/Lua 网关 + Kvrocks(硬盘)缓存
+- **服务端(选一)**:
+  - `openresty/lua/kvcache/` —— OpenResty/Lua 网关 + Kvrocks(硬盘)缓存(生产推荐)
+  - `tail/gateway/` —— Python(FastAPI)网关 + Storage 抽象(默认 dbm 零依赖,或 Kvrocks)
 
 ---
 
@@ -47,8 +49,14 @@ OpenResty 三阶段(对应设计文档第 5.3 节):
 ## 2. 目录结构
 
 ```
-tail/                      # 客户端
-└── openai_patch.py        # ★ openai 官方 SDK monkey patch(指纹校验 + session 隔离 + 自动重试)
+tail/                      # 客户端 + Python gateway
+├── openai_patch.py        # ★ openai 官方 SDK monkey patch(指纹校验 + session 隔离 + 自动重试)
+└── gateway/               # ★ Python 版网关(FastAPI,与 OpenResty 版可互换)
+    ├── app.py             # FastAPI 路由(三阶段:命中还原/转发/异步写)
+    ├── storage.py         # Storage 抽象 + DbmStorage(零依赖,默认)/ 可插拔 Redis
+    ├── segment.py / merkle.py / hashing.py   # v2.1 算法(与 Lua 哈希逐字节一致)
+    ├── protocol.py        # 常量 + compute_expire + GatewayConfig
+    └── __main__.py        # 命令行入口
 openresty/                 # ★ 服务端:OpenResty/Lua 网关 + Kvrocks 硬盘缓存(v2.1 Segment-Merkle)
 ├── conf/nginx.conf        # 网关配置(access/header_filter/log 三阶段挂 Lua)
 ├── conf/kvrocks.conf      # Kvrocks 配置(端口 6666,数据落盘)
@@ -120,6 +128,20 @@ client.chat.completions.create(
     messages=[{"role": "user", "content": "Hello"}],
 )
 ```
+
+### 4.2b 启动 Python 版网关(可选,无需编译 OpenResty)
+
+```bash
+# 默认 dbm 存储(零依赖),后端指向真实推理服务
+python -m tail.gateway --backend https://api.deepseek.com --port 8765
+
+# 或连 Kvrocks(与 OpenResty 版共享缓存)
+python -m tail.gateway --backend https://api.deepseek.com --storage redis \
+    --kvrocks-host 127.0.0.1 --kvrocks-port 6666
+```
+
+Python gateway 与 OpenResty gateway 产出的 `cache_key` **逐字节一致**
+(同样的 messages → 同样的 `sys::tools::pfx`),两者可互换或共存。
 
 ### 4.3 跑测试
 

@@ -43,3 +43,6 @@ Thumbs.db
 *.bak
 *.orig
 /tmp/
+# 本地启动脚本(含密钥,不提交)
+run-agent.sh
+start*.sh
