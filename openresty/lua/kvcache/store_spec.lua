@@ -1,131 +1,111 @@
--- Lua 单元测试:store 模块(纯 Kvrocks,无 L1)。
--- 通过注入 mock resty.redis,模拟 Kvrocks 响应,验证 get/set_sync/set_async/del 逻辑。
--- 不依赖真实 Kvrocks 服务(真实链路由端到端测试覆盖)。
+-- Lua 单元测试:store v2.1(三段 Segment-Merkle 存储操作)。
+-- 连真 Kvrocks(端口 6666);不可达则跳过。
+local store = require "kvcache.store"
+
 local pass, fail = 0, 0
 local function check(name, cond)
     if cond then pass = pass + 1; print(("  PASS  %s"):format(name))
     else fail = fail + 1; print(("  FAIL  %s"):format(name)); end
 end
 
--- 内存表模拟 Kvrocks,每次 store.connect 会创建一个新实例但共享同一个 kv
-local kv = {}
-local renew_log = {}   -- 记录 expire 续期调用:{[key]=ttl},供续期测试断言
-
-local function make_mock_redis()
-    local obj = {}
-    function obj:set_timeouts() end
-    function obj:connect() return true end
-    function obj:set_keepalive() return true end
-    function obj:set(k, v, ex, ttl)
-        kv[k] = v
-        return "OK"
-    end
-    function obj:get(k)
-        if kv[k] == nil then return ngx.null end
-        return kv[k]
-    end
-    function obj:expire(k, ttl)
-        -- 记录续期调用到模块级表,便于测试断言"读后被续期"
-        renew_log[k] = ttl
-        return 1
-    end
-    function obj:del(k)
-        local existed = kv[k] ~= nil
-        kv[k] = nil
-        return existed and 1 or 0
-    end
-    return obj
-end
-
--- 让 require("resty.redis").new() 返回我们的 mock
-package.preload["resty.redis"] = function()
-    return { new = make_mock_redis }
-end
-
--- 清掉已加载的 store,让它重新 require 我们的 mock redis
-package.loaded["kvcache.store"] = nil
-local store = require "kvcache.store"
-
-local cjson = require "cjson.safe"
 local cfg = {
-    ttl = 100, jitter = 0,
-    max_prefix_bytes = 8 * 1024 * 1024,
-    hash_ns = "prefix_cache",
-    kvrocks_host = "127.0.0.1", kvrocks_port = 6666,
-    renew_ttl = 1800,
+    hash_ns = "test_spec", kvrocks_host = "127.0.0.1", kvrocks_port = 6666,
+    ttl = 100, renew_ttl = 1800, ttl_stable = 86400,
 }
-local now = ngx and ngx.time() or os.time()
 
--- 1. set_sync 写入 + get 命中
-local entry = {
-    messages = { { role = "user", content = "hi" } },
-    model = "m", prefix_length = 1, expire_at = now + 1000,
-}
-local ok, err = store.set_sync(cfg, "h1", entry)
-check("set_sync 返回 true", ok == true)
-local got, level = store.get(cfg, "h1")
-check("set_sync 后 get 命中", got ~= nil)
-check("get 命中 level=kvrocks", level == "kvrocks")
-check("get 命中内容正确(messages)", got and got.messages[1].content == "hi")
-check("get 命中 prefix_length 正确", got and got.prefix_length == 1)
-check("get 命中 model 正确", got and got.model == "m")
+-- ping 检查 Kvrocks 是否可达
+if not store.ping(cfg) then
+    print("Kvrocks 不可达,跳过 store_spec")
+    os.exit(0)
+end
 
--- 2. 不存在的 key
-local got2, lvl2 = store.get(cfg, "nope")
-check("get 不存在返回 nil", got2 == nil)
-check("get 不存在 level=miss", lvl2 == "miss")
+-- 每个测试前清空命名空间
+local function clean() store.clear(cfg) end
 
--- 3. del 删除后 miss
-store.del(cfg, "h1")
-local got3 = store.get(cfg, "h1")
-check("del 后 get 返回 nil", got3 == nil)
+-- 1. ping
+check("ping Kvrocks", store.ping(cfg))
 
--- 4. set_async 写入(直接传 blob)
-local blob = cjson.encode(entry)
-local ok4 = store.set_async(cfg, "h2", blob)
-check("set_async 返回 true", ok4 == true)
-check("set_async 后 get 命中", store.get(cfg, "h2") ~= nil)
+-- 2. put_request + get_meta roundtrip
+clean()
+local cache_key = store.put_request(cfg, {
+    system = "SYS", tools = {{"tool1"}},
+    messages = {{role="user",content="q1"},{role="assistant",content="a1"},{role="user",content="q2"}},
+}, os.time() + 1000)
+check("put_request 返回 cache_key", cache_key ~= nil and cache_key:find("::") ~= nil)
+check("cache_key 三段", select(2, cache_key:gsub("::", "")) == 2)  -- 2 个 :: = 3 段
 
--- 5. 超大内容 set_sync 拒绝
-local big_entry = {
-    messages = { { role = "user", content = string.rep("x", 1000) } },
-    model = "m", prefix_length = 1, expire_at = now + 1000,
-}
-local cfg_small = { ttl = 100, jitter = 0, max_prefix_bytes = 10,
-                    hash_ns = "prefix_cache", kvrocks_host = "127.0.0.1", kvrocks_port = 6666 }
-local ok5, err5 = store.set_sync(cfg_small, "h3", big_entry)
-check("超大内容 set_sync 返回 false", ok5 == false)
-check("超大内容 err=too_large", err5 == "too_large")
+local meta = store.get_meta(cfg, cache_key)
+check("get_meta 返回 meta", meta ~= nil)
+check("meta.len = 3", meta and meta.len == 3)
+check("meta 含 pfx_hash", meta and meta.pfx_hash ~= nil and meta.pfx_hash ~= "0")
+check("meta 含 sys_hash != 0", meta and meta.sys_hash ~= "0")
 
--- 6. set_async 超大 blob 拒绝
-local big_blob = string.rep("x", 1000)
-local ok6, err6 = store.set_async(cfg_small, "h4", big_blob)
-check("超大 blob set_async 返回 false", ok6 == false)
-check("超大 blob err=too_large", err6 == "too_large")
+-- 3. 还原 messages
+clean()
+store.put_request(cfg, {
+    system = nil, tools = nil,
+    messages = {{role="user",content="q1"},{role="assistant",content="a1"},{role="user",content="q2"},{role="assistant",content="a2"},{role="user",content="q3"}},
+}, os.time() + 1000)
+-- 重新算 pfx_hash(从同 messages)
+local segment = require "kvcache.segment"
+local merkle = require "kvcache.merkle"
+local segs = segment.split({{role="user",content="q1"},{role="assistant",content="a1"},{role="user",content="q2"},{role="assistant",content="a2"},{role="user",content="q3"}})
+local seg_hashes = {}
+for i, s in ipairs(segs) do seg_hashes[i] = merkle.segment_hash(s) end
+local pfx_hash = merkle.chain_hash(seg_hashes)
+local reconstructed = store.reconstruct(cfg, pfx_hash)
+check("reconstruct 还原成功", reconstructed ~= nil)
+check("reconstruct 5 条", reconstructed and #reconstructed == 5)
+check("reconstruct 顺序正确", reconstructed and reconstructed[1].content == "q1" and reconstructed[5].content == "q3")
 
--- 7. 过期 entry 被 get 判定为无效
-kv["expired_key"] = cjson.encode({
-    messages = { { role = "user", content = "old" } },
-    model = "m", prefix_length = 1, expire_at = now - 100,  -- 已过期
-})
-local got7, lvl7 = store.get(cfg, "expired_key")
-check("过期 entry get 返回 nil", got7 == nil)
--- level 可能是 "expired" 或经过 miss 路径,不强断言具体字符串
+-- 4. 缺失段(无 system 无 tools)
+clean()
+local ck2 = store.put_request(cfg, {
+    system = nil, tools = nil, messages = {{role="user",content="hi"}},
+}, os.time() + 1000)
+check("缺失段 cache_key 以 0::0 开头", ck2:sub(1,4) == "0::0")
 
--- 8. 命中后内容是深拷贝语义(mock 直接存引用,但 store 不修改返回值)
-local got8 = store.get(cfg, "h2")
-check("命中 entry 含 expire_at", got8 and got8.expire_at ~= nil)
+-- 5. get_segment_field:sys/tools
+clean()
+store.put_request(cfg, {
+    system = "MYSYS", tools = nil, messages = {{role="user",content="q"}},
+}, os.time() + 1000)
+-- 算 sys_hash
+local hashing = require "kvcache.hashing"
+local sys_hash = hashing.sha256_hex16("MYSYS")
+local sys_val = store.get_segment_field(cfg, "sys", sys_hash)
+check("get sys 全文", sys_val == "MYSYS")
+check("NULL_HASH sys 返回 nil", store.get_segment_field(cfg, "sys", "0") == nil)
 
--- 9. 访问驱动续期(§7.4):get 命中后应调用 expire 续期
-renew_log = {}                          -- 清空续期日志
-store.get(cfg, "h2")                    -- 命中读取
-check("get 命中后触发 expire 续期", renew_log["prefix_cache:h2"] ~= nil)
-check("续期 TTL = cfg.renew_ttl(1800)", renew_log["prefix_cache:h2"] == 1800)
+-- 6. 链断裂:删中间 pfx 节点 → reconstruct 返回 nil
+clean()
+store.put_request(cfg, {
+    system = nil, tools = nil,
+    messages = {{role="user",content="q1"},{role="assistant",content="a1"},{role="user",content="q2"},{role="assistant","a2"},{role="user",content="q3"}},
+}, os.time() + 1000)
+-- 删根节点(第一个 pfx)
+local resty_redis = require "resty.redis"
+local red = resty_redis:new()
+red:connect("127.0.0.1", 6666)
+-- 找到并删一个 pfx 节点(根)
+-- 重新算所有节点 hash
+local segs2 = segment.split({{role="user",content="q1"},{role="assistant",content="a1"},{role="user",content="q2"},{role="assistant","a2"},{role="user",content="q3"}})
+local sh2 = {}
+for i, s in ipairs(segs2) do sh2[i] = merkle.segment_hash(s) end
+local nodes = merkle.build_nodes(sh2)
+local root_pfx = nodes[1].pfx_hash
+red:del("test_spec:pfx:" .. root_pfx)
+red:set_keepalive(10000, 100)
+local broken = store.reconstruct(cfg, nodes[#nodes].pfx_hash)
+check("链断裂 reconstruct 返回 nil", broken == nil)
 
--- 10. miss 不续期(不存在的 key 不该续期)
-renew_log = {}
-store.get(cfg, "definitely_missing_key")
-check("miss 不触发续期", renew_log["prefix_cache:definitely_missing_key"] == nil)
+-- 7. 软过期:expire_at 已过 → get_meta 返回 nil
+clean()
+local ck_expired = store.put_request(cfg, {
+    system = nil, tools = nil, messages = {{role="user",content="q"}},
+}, os.time() - 100)  -- 已过期
+check("过期 meta 返回 nil", store.get_meta(cfg, ck_expired) == nil)
 
+clean()
 print(("\n总计: %d 通过, %d 失败"):format(pass, fail))
 if fail > 0 then os.exit(1) end

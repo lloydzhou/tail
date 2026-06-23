@@ -8,15 +8,19 @@ local resty_str = require "resty.string"   -- to_hex
 local M = {}
 
 -- 对任意字符串计算 SHA256,返回 16 位十六进制前缀。
-local function sha256_hex16(s)
+-- (导出供 merkle.lua 复用)
+M.sha256_hex16 = function(s)
     local sha = resty_sha256:new()
     sha:update(s)
     local bin = sha:final()
     return string.sub(resty_str.to_hex(bin), 1, 16)
 end
 
+local sha256_hex16 = M.sha256_hex16
+
 -- 把单条 message 编码成稳定字符串(参与哈希)。
-local function encode_message(msg)
+-- (导出供 merkle.lua 复用)
+M.encode_message = function(msg)
     local role = msg.role or ""
     local content = msg.content
     if type(content) == "table" then
@@ -30,6 +34,8 @@ local function encode_message(msg)
     return tostring(#role) .. ":" .. role .. "\x00" ..
            tostring(#content) .. ":" .. content .. "\x01"
 end
+
+local encode_message = M.encode_message
 
 -- 对一段 messages 列表(前缀)计算哈希。
 -- @param messages table: OpenAI messages 数组

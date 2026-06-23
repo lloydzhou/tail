@@ -16,6 +16,7 @@ M.DEFAULT_TTL_JITTER = 600               -- ±秒,防雪崩
 M.DEFAULT_MAX_PREFIX_BYTES = 8 * 1024 * 1024  -- 单条前缀上限 8MB,防滥用
 M.DEFAULT_HASH_NS = "prefix_cache"        -- Kvrocks key 前缀
 M.DEFAULT_RENEW_TTL = 30 * 60             -- 访问驱动续期 TTL(秒),见 §7.4
+M.DEFAULT_STABLE_TTL = 24 * 3600          -- sys/tools/seg 稳定内容 TTL(秒)
 
 -- 缓存未命中处理模式
 M.MISS_FAST_FAIL = "fast_fail"            -- 默认:不转发,返回 422 由 SDK 重试
@@ -35,6 +36,7 @@ function M.get_config()
             var.kvcache_miss_mode        = ngx.var.kvcache_miss_mode
             var.kvcache_kvrocks_host     = ngx.var.kvcache_kvrocks_host
             var.kvcache_kvrocks_port     = ngx.var.kvcache_kvrocks_port
+            var.kvcache_renew_ttl        = ngx.var.kvcache_renew_ttl
         end
     end)
     return {
@@ -47,6 +49,7 @@ function M.get_config()
         kvrocks_host      = var.kvcache_kvrocks_host or "127.0.0.1",
         kvrocks_port      = tonumber(var.kvcache_kvrocks_port) or 6666,
         renew_ttl         = tonumber(var.kvcache_renew_ttl) or M.DEFAULT_RENEW_TTL,
+        ttl_stable        = M.DEFAULT_STABLE_TTL,  -- sys/tools/seg 长 TTL
     }
 end
 

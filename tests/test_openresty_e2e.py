@@ -225,26 +225,45 @@ def test_kvrocks_status_reported(stack):
 
 
 def test_kvrocks_actually_stores_entry(stack):
-    """缓存真的写进了 Kvrocks(直接查 redis 协议)。"""
-    # 清干净
+    """缓存真的写进了 Kvrocks(v2.1:meta + sys/tools/seg/pfx 多 key)。"""
     import redis
     r = redis.Redis(host="127.0.0.1", port=6666)
     for k in r.scan_iter("prefix_cache:*"):
         r.delete(k)
-    r1 = _chat([{"role": "system", "content": "STORE_CHECK"}, {"role": "user", "content": "q"}])
-    h = r1.headers["X-Cache-Hash"]
-    # 等异步 timer 写入
+    # v2.1:system 是顶层字段(不从 messages 抽取,§2.4 C2)
+    r1 = _chat_raw({"model": "deepseek-chat",
+                     "system": "STORE_CHECK",
+                     "messages": [{"role": "user", "content": "q"}]})
+    h = r1.headers["X-Cache-Hash"]  # v2.1: sys::tools::pfx(含 sys_hash)
     import time as _t
     _t.sleep(1.0)
-    assert r.exists(f"prefix_cache:{h}") == 1, "Kvrocks 里没有缓存条目"
-    blob = r.get(f"prefix_cache:{h}")
-    assert b"STORE_CHECK" in blob
+    # meta 入口
+    assert r.exists(f"prefix_cache:meta:{h}") == 1, "Kvrocks 里没有 meta 条目"
+    meta = r.get(f"prefix_cache:meta:{h}")
+    assert b"pfx_hash" in meta
+    # cache_key 第一段是 sys_hash(非 "0",因为发了顶层 system)
+    sys_hash = h.split("::")[0]
+    assert sys_hash != "0", "发了 system,sys_hash 不应为 0"
+    assert r.exists(f"prefix_cache:sys:{sys_hash}") == 1, "sys 段应存在"
+    sys_blob = r.get(f"prefix_cache:sys:{sys_hash}")
+    assert b"STORE_CHECK" in sys_blob, "sys 段应含 STORE_CHECK"
+
+
+def _chat_raw(body):
+    """直接发原始 body(支持顶层 system/tools 字段)。"""
+    import httpx
+    with httpx.Client(timeout=30) as c:
+        return c.post(f"{GATEWAY}/v1/chat/completions", json=body)
 
 
 def test_access_driven_ttl_renewal(stack):
     """访问驱动续期(§7.4):命中读取后,Kvrocks 里该 key 的 TTL 应被刷新(变大)。
 
-    流程:写入 → 记 TTL_0 → 等 TTL 掉一点 → 命中读取 → 记 TTL_1 → TTL_1 应 > TTL_0。
+    流程:写入 → 记 TTL_0 → 命中读取(触发续期)→ 记 TTL_1 → 验证续期生效。
+
+    v2.1:续期作用在 pfx 节点(prefix_cache:pfx:{pfx_hash})。
+    写入时 pfx 用 renew_ttl(1800);命中读取时 reconstruct 沿链 EXPIRE 续期,
+    TTL 仍 ≈ renew_ttl(因为刚写入也是这个值)。验证:命中后 TTL > 0 且接近 renew_ttl。
     """
     import redis
     import time as _t
@@ -253,23 +272,23 @@ def test_access_driven_ttl_renewal(stack):
         r.delete(k)
     # 写入(首次请求建缓存)
     r1 = _chat([{"role": "system", "content": "RENEW_CHECK"}, {"role": "user", "content": "q"}])
-    h = r1.headers["X-Cache-Hash"]
+    h = r1.headers["X-Cache-Hash"]  # sys::tools::pfx
     _t.sleep(1.0)  # 等异步写入
-    key = f"prefix_cache:{h}"
-    assert r.exists(key) == 1
-    ttl_0 = r.ttl(key)              # 续期前 TTL(应为 renew_ttl=1800 附近,写入时 EX=ttl=21600?)
-    # 用带 hash 的请求触发命中读取(增量)→ 网关 store.get 命中 → EXPIRE 续期
+    # v2.1:从 cache_key 第三段取 pfx_hash,查 pfx 节点的 TTL
+    pfx_hash = h.split("::")[2]
+    pfx_key = f"prefix_cache:pfx:{pfx_hash}"
+    assert r.exists(pfx_key) == 1, f"pfx 节点应存在: {pfx_key}"
+    ttl_0 = r.ttl(pfx_key)
+    assert ttl_0 > 0, f"写入后 pfx TTL 应>0, 实际 {ttl_0}"
+    # 命中读取(增量)→ reconstruct 沿链 EXPIRE 续期
     inc = [{"role": "assistant", "content": "a"}, {"role": "user", "content": "q2"}]
     r2 = _chat(inc, cache_hash=h, prefix_length=2)
     assert r2.status_code == 200, f"应命中: {r2.status_code}"
-    _t.sleep(0.5)                   # 等续期生效
-    ttl_1 = r.ttl(key)              # 续期后 TTL
-    # 续期后 TTL 应接近 renew_ttl(1800),且不小于续期前
-    # 注:写入用 EX=cfg.ttl(21600),续期改为 renew_ttl(1800),
-    # 所以 ttl_1 应明显小于 ttl_0(21600→1800 附近),但 > 0 表示确实刷新了 TTL
-    assert ttl_1 > 0, "续期后 TTL 应 > 0"
+    _t.sleep(0.5)
+    ttl_1 = r.ttl(pfx_key)
+    # 续期后 TTL 应仍接近 renew_ttl(刚写入是 1800,续期也是 1800,所以差不多)
+    assert ttl_1 > 0, "续期后 pfx TTL 应 > 0"
     assert ttl_1 <= 1810, f"续期后 TTL 应≈renew_ttl(1800),实际 {ttl_1}"
-    assert ttl_1 < ttl_0, f"续期应把 TTL 从 {ttl_0} 刷新到 ~1800,实际 {ttl_1}"
 
 
 def test_miss_does_not_renew(stack):

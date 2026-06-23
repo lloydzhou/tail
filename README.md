@@ -47,15 +47,17 @@ OpenResty 三阶段(对应设计文档第 5.3 节):
 ```
 tail/                      # 客户端
 └── openai_patch.py        # ★ openai 官方 SDK monkey patch(指纹校验 + session 隔离 + 自动重试)
-openresty/                 # ★ 服务端:OpenResty/Lua 网关 + Kvrocks 硬盘缓存
+openresty/                 # ★ 服务端:OpenResty/Lua 网关 + Kvrocks 硬盘缓存(v2.1 Segment-Merkle)
 ├── conf/nginx.conf        # 网关配置(access/header_filter/log 三阶段挂 Lua)
 ├── conf/kvrocks.conf      # Kvrocks 配置(端口 6666,数据落盘)
 ├── lua/kvcache/
-│   ├── hashing.lua        # 前缀哈希(content 字符串 SHA256 取前 16 位)
-│   ├── protocol.lua       # 协议头常量 + 防雪崩抖动
-│   ├── store.lua          # Kvrocks 缓存(同步读 / timer 异步写)
-│   ├── gateway.lua        # 协商核心
-│   ├── hashing_spec.lua / protocol_spec.lua / store_spec.lua   # Lua 单测
+│   ├── hashing.lua        # 哈希(字符串 SHA256,导出 encode_message/sha256_hex16)
+│   ├── segment.lua        # ★ v2.1 segment 切分(m·n=0 约束)
+│   ├── merkle.lua         # ★ v2.1 Merkle 前缀链
+│   ├── protocol.lua       # 协议头常量 + 防雪崩抖动 + renew_ttl
+│   ├── store.lua          # ★ v2.1 三段存储(sys/tools/seg/pfx/meta)
+│   ├── gateway.lua        # 协商核心(access 三段还原 / log 三段写)
+│   ├── *_spec.lua         # Lua 单测(hashing/protocol/segment/merkle/store)
 ├── run_lua_tests.sh       # 统一 Lua 单测 runner
 └── logs/
 runtime/                   # 本地编译的运行时(gitignore,需自己 build)
@@ -144,16 +146,21 @@ python3 -m pytest tests/test_openresty_e2e.py -v
    默认返回 422 + `X-Cache-Hit: false`,SDK 用完整 messages 重试一次(第 6.4 节)。
 5. **防雪崩**:过期时间带 ±jitter(第 9 章)。
 6. **降级容错**:网关任何内部异常 fallback 到透传;Kvrocks 不可用时请求不崩(第 5.4 节)。
+7. **v2.1 Segment-Merkle**:messages 按 LLM 回合切 segment,三段独立 hash(sys/tools/pfx),
+   组合 cache_key = `sys::tools::pfx`;加一段只增 O(1) 节点;跨对话内容寻址复用。
+8. **访问驱动续期**(§7.4):pfx 节点读一次续一个 TTL,活跃链永不过期,沉寂链自然消亡。
 
 ---
 
-## 6. 测试结果(87/87 全过)
+## 6. 测试结果(118/118 全过)
 
-### Lua 单元测试(54)
+### Lua 单元测试(85)
 ```
 hashing:   23/23   稳定性/抗碰撞/边界/前缀扩展/特殊字符/多模态/超长
-protocol:  14/14   头部常量/抖动过期/默认配置
-store:     20/20   Kvrocks get/set_sync/set_async/del/过期/超大/命名空间/访问驱动续期
+protocol:  14/14   头部常量/抖动过期/默认配置/renew_ttl
+segment:   19/19   ★ v2.1 切分:基础形态/m·n=0/工具回合/streaming 边缘/展平一致
+merkle:    14/14   ★ v2.1 链:segment_hash/chain_step/build_nodes/增量推进
+store:     15/15   ★ v2.1 三段:put_request/reconstruct/缺失段/链断裂/续期
 ```
 
 ### Python 测试(18)

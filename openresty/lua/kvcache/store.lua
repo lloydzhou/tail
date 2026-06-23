@@ -1,98 +1,206 @@
--- 前缀缓存存储:直接用 Kvrocks(Redis 协议,数据落硬盘)。
--- 按需求去掉了 L1 共享内存层,统一以 Kvrocks 作为唯一缓存后端。
--- 对应设计文档第 5.1 节「Redis 集群(二级缓存)」——这里用 Kvrocks 替代 Redis,
--- 并把它作为主缓存(硬盘存储,可存远超内存的量)。
+-- v2.1 分层 Segment-Merkle 缓存存储(直连 Kvrocks)。
+-- 对应设计文档 §2.3、§3、§6、§7.4。
 --
--- 约束:cosocket 只能在 access/rewrite/content/rewardset 阶段使用,
--- log_by_lua/header_filter_by_lua 阶段禁止。因此:
---   - 读(access 阶段):同步 cosocket 直连 Kvrocks。
---   - 写(log 阶段):用 ngx.timer.at 异步执行。
+-- 五种 key(命名空间 ns 默认 "prefix_cache"):
+--   {ns}:sys:{sys_hash}    → system 全文
+--   {ns}:tools:{tools_hash}→ tools 全文
+--   {ns}:seg:{seg_hash}    → segment 全文(JSON)
+--   {ns}:pfx:{pfx_hash}    → Merkle 节点 {prev, seg_ref, seg_count}
+--   {ns}:meta:{cache_key}  → {sys_hash, tools_hash, pfx_hash, len, expire_at}
 --
--- Value 用 cjson 序列化:{ messages=..., model=..., prefix_length=..., expire_at=... }
+-- cache_key = sys_hash :: tools_hash :: pfx_hash(缺失段为 "0")
+--
+-- 约束:cosocket 只在 access 阶段;log 阶段用 ngx.timer.at 异步。
 local resty_redis = require "resty.redis"
 local cjson = require "cjson.safe"
+local segment = require "kvcache.segment"
+local merkle = require "kvcache.merkle"
+local hashing = require "kvcache.hashing"
 
 local M = {}
 
--- 构造一个配置好超时 + 连接池的 redis client(已连接)。
--- 失败返回 nil + err。
+M.NULL_HASH = "0"  -- 缺失段(system/tools)的固定占位
+
+-- 构造配置好超时 + 连接池的 redis client(已连接)。失败返回 nil + err。
 local function connect(cfg)
     local red = resty_redis:new()
     red:set_timeouts(100, 300, 300)
     local ok, err = red:connect(cfg.kvrocks_host, cfg.kvrocks_port)
-    if not ok then
-        return nil, err
-    end
+    if not ok then return nil, err end
     return red
 end
 
--- 同步读取缓存(access 阶段调用)。
--- @param cfg protocol.get_config()
--- @param hash string
--- @return entry table or nil, level or err
-function M.get(cfg, hash)
-    local now = ngx and ngx.time() or os.time()
+local function k(cfg, kind, h) return cfg.hash_ns .. ":" .. kind .. ":" .. h end
+
+-- ===========================================================================
+-- 读取(access 阶段,允许 cosocket)
+-- ===========================================================================
+
+-- 读 meta。返回 meta table 或 nil。
+function M.get_meta(cfg, cache_key)
     local red, err = connect(cfg)
-    if not red then return nil, "connect_fail:" .. tostring(err) end
-    local key = cfg.hash_ns .. ":" .. hash
-    local blob = red:get(key)
-    -- 访问驱动续期(§7.4):命中则在归还连接前刷新 TTL,活跃链不过期。
-    -- 续期失败不影响本次读取(降级为不续期)。
-    if blob ~= nil and blob ~= ngx.null then
-        pcall(function()
-            red:expire(key, cfg.renew_ttl or 1800)
-        end)
-    end
+    if not red then return nil end
+    local blob = red:get(k(cfg, "meta", cache_key))
     red:set_keepalive(10000, 100)
-    if blob == nil or blob == ngx.null then
-        return nil, "miss"
+    if blob == nil or blob == ngx.null then return nil end
+    local meta = cjson.decode(blob)
+    if not meta then return nil end
+    if meta.expire_at and meta.expire_at <= (ngx and ngx.time() or os.time()) then
+        return nil  -- 软过期
     end
-    local entry = cjson.decode(blob)
-    if not entry then return nil, "corrupt" end
-    if entry.expire_at and entry.expire_at <= now then
-        return nil, "expired"
-    end
-    return entry, "kvrocks"
+    return meta
 end
 
--- 同步写入(只在允许 cosocket 的阶段可用,如 access)。
-function M.set_sync(cfg, hash, entry)
-    local blob = cjson.encode(entry)
-    if not blob or #blob > cfg.max_prefix_bytes then
-        return false, "too_large"
-    end
+-- 读 system/tools 全文。NULL_HASH → 返回 nil(缺失);否则返回字符串或 nil。
+function M.get_segment_field(cfg, kind, hash_value)
+    if hash_value == M.NULL_HASH then return nil end
     local red, err = connect(cfg)
-    if not red then return false, err end
-    local key = cfg.hash_ns .. ":" .. hash
-    local ttl = math.max(1, entry.expire_at - (ngx and ngx.time() or os.time()))
-    local res = red:set(key, blob, "EX", ttl)
+    if not red then return nil end
+    local blob = red:get(k(cfg, kind, hash_value))
     red:set_keepalive(10000, 100)
-    return res == "OK", nil
+    if blob == nil or blob == ngx.null then return nil end
+    -- sys/tools 存的是原文(可能 string 或 JSON),直接返回让调用方处理
+    return blob
 end
 
--- 异步写入(供 log_by_lua 阶段在 ngx.timer.at 回调里调用)。
--- @param cfg table, hash string, blob string(已序列化)
-function M.set_async(cfg, hash, blob)
-    if not blob or #blob > cfg.max_prefix_bytes then
-        return false, "too_large"
-    end
+-- 还原 messages 前缀:沿 prev 回溯 + mget seg。
+-- 回溯时对每个 pfx 节点 EXPIRE 续期(§7.4)。
+-- 链断/损坏返回 nil。
+-- @return messages table 或 nil
+function M.reconstruct(cfg, pfx_hash)
+    if pfx_hash == merkle.EMPTY_HASH then return {} end
     local red, err = connect(cfg)
-    if not red then return false, err end
-    local key = cfg.hash_ns .. ":" .. hash
-    -- TTL 从 blob 里反解 expire_at 比较麻烦,这里用 cfg.ttl(够用)
-    local res = red:set(key, blob, "EX", cfg.ttl or 21600)
+    if not red then return nil end
+
+    -- 1. 沿 prev 回溯,收集 seg_ref,同时对每个 pfx 续期
+    local seg_refs = {}
+    local cur = pfx_hash
+    local seen = {}
+    while cur ~= merkle.EMPTY_HASH do
+        if seen[cur] then red:set_keepalive(10000, 100); return nil end  -- 防环
+        seen[cur] = true
+        local blob = red:get(k(cfg, "pfx", cur))
+        if blob == nil or blob == ngx.null then
+            red:set_keepalive(10000, 100); return nil  -- 链断
+        end
+        -- 续期(失败不影响,pcall 保护)
+        pcall(function() red:expire(k(cfg, "pfx", cur), cfg.renew_ttl or 1800) end)
+        local node = cjson.decode(blob)
+        if not node or not node.seg_ref then
+            red:set_keepalive(10000, 100); return nil
+        end
+        seg_refs[#seg_refs + 1] = node.seg_ref
+        cur = node.prev
+    end
     red:set_keepalive(10000, 100)
-    return res == "OK", nil
+
+    -- seg_refs 现在是逆序(seg_k, seg_{k-1}, ..., seg_1),reverse
+    local n = #seg_refs
+    for i = 1, math.floor(n / 2) do
+        seg_refs[i], seg_refs[n - i + 1] = seg_refs[n - i + 1], seg_refs[i]
+    end
+
+    -- 2. 批量 mget 所有 seg,flatten 还原 messages
+    if n == 0 then return {} end
+    local red2, err2 = connect(cfg)
+    if not red2 then return nil end
+    local keys = {}
+    for i, sh in ipairs(seg_refs) do keys[i] = k(cfg, "seg", sh) end
+    local blobs = red2:mget(unpack(keys))
+    red2:set_keepalive(10000, 100)
+    if not blobs then return nil end
+
+    local messages = {}
+    for _, blob in ipairs(blobs) do
+        if blob == ngx.null or blob == nil then return nil end  -- 某 segment 缺失
+        local seg_msgs = cjson.decode(blob)
+        if not seg_msgs then return nil end
+        for _, m in ipairs(seg_msgs) do messages[#messages + 1] = m end
+    end
+    return messages
 end
 
--- 删除一条缓存(测试/运维用)。
-function M.del(cfg, hash)
+-- ===========================================================================
+-- 写入(供 log 阶段在 ngx.timer.at 回调里调用)
+-- ===========================================================================
+
+-- 写一个完整请求,返回 cache_key。
+-- @param request table: { system=string|nil, tools=table|nil, messages=table, model=string }
+-- @param expire_at number: Unix 秒
+-- @return cache_key string
+function M.put_request(cfg, request, expire_at)
     local red, err = connect(cfg)
-    if not red then return false, err end
-    local key = cfg.hash_ns .. ":" .. hash
-    local res = red:del(key)
+    if not red then return nil, err end
+
+    -- 三段 hash
+    local sys_hash = M.NULL_HASH
+    local tools_hash = M.NULL_HASH
+    local system_val = request.system
+    local tools_val = request.tools
+
+    if system_val ~= nil then
+        sys_hash = hashing.sha256_hex16(tostring(system_val))
+        red:setnx(k(cfg, "sys", sys_hash), tostring(system_val))
+        red:expire(k(cfg, "sys", sys_hash), cfg.ttl_stable or 86400)
+    end
+    if tools_val ~= nil then
+        local tools_blob = cjson.encode(tools_val)
+        tools_hash = hashing.sha256_hex16(tools_blob)
+        red:setnx(k(cfg, "tools", tools_hash), tools_blob)
+        red:expire(k(cfg, "tools", tools_hash), cfg.ttl_stable or 86400)
+    end
+
+    -- messages → segment → merkle 链
+    local messages = request.messages or {}
+    local segs = segment.split(messages)
+    local seg_hashes = {}
+    for i, s in ipairs(segs) do
+        local sh = merkle.segment_hash(s)
+        seg_hashes[i] = sh
+        red:setnx(k(cfg, "seg", sh), cjson.encode(s))
+        red:expire(k(cfg, "seg", sh), cfg.ttl_stable or 86400)
+    end
+    local nodes = merkle.build_nodes(seg_hashes)
+    for _, n in ipairs(nodes) do
+        red:setnx(k(cfg, "pfx", n.pfx_hash), cjson.encode(n.node))
+        red:expire(k(cfg, "pfx", n.pfx_hash), cfg.renew_ttl or 1800)
+    end
+    local pfx_hash = (#nodes > 0) and nodes[#nodes].pfx_hash or merkle.EMPTY_HASH
+
+    local cache_key = sys_hash .. "::" .. tools_hash .. "::" .. pfx_hash
+    local meta = {
+        sys_hash = sys_hash, tools_hash = tools_hash, pfx_hash = pfx_hash,
+        len = #messages, expire_at = expire_at,
+    }
+    red:set(k(cfg, "meta", cache_key), cjson.encode(meta), "EX", cfg.ttl or 21600)
     red:set_keepalive(10000, 100)
-    return res, nil
+    return cache_key
+end
+
+-- ===========================================================================
+-- 运维/测试辅助
+-- ===========================================================================
+
+function M.ping(cfg)
+    local red, err = connect(cfg)
+    if not red then return false end
+    local ok = red:ping()
+    red:set_keepalive(10000, 100)
+    return ok == "PONG"
+end
+
+-- 清空本命名空间(测试用)。
+function M.clear(cfg)
+    local red, err = connect(cfg)
+    if not red then return end
+    local cursor = "0"
+    repeat
+        local res = red:scan(cursor, "MATCH", cfg.hash_ns .. ":*", "COUNT", 200)
+        if not res then break end
+        cursor = res[1]
+        for i = 2, #res do red:del(res[i]) end
+    until cursor == "0"
+    red:set_keepalive(10000, 100)
 end
 
 return M
