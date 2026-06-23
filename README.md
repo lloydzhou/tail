@@ -18,19 +18,17 @@
 
 ## 1. 架构(生产版)
 
-```
-┌─────────────────┐   精简请求(哈希+增量)    ┌──────────────────┐   完整请求   ┌──────────────┐
-│  openai SDK     │ ──────────────────────────▶│  OpenResty 网关  │ ────────────▶│  推理服务     │
-│ (monkey patch) │ ◀──────────────────────────│  (Lua 协商核心)  │ ◀────────────│ (DeepSeek 等)│
-│  本地缓存       │   X-Cache-Hash/Expire/Hit  │        │         └──────────────┘
-└─────────────────┘                            └────────┼────────┘
-                                                        │ 缓存后端(唯一):Kvrocks
-                                                        │   数据落硬盘,Redis 协议
-                                                        ▼
-                                                 ┌──────────────────┐
-                                                 │  Kvrocks (6666)  │
-                                                 │  RocksDB on disk │
-                                                 └──────────────────┘
+```mermaid
+flowchart LR
+    SDK["openai SDK<br/>(monkey patch)<br/>本地缓存"]
+    GW["OpenResty 网关<br/>(Lua 协商核心)"]
+    BE["推理服务<br/>(DeepSeek 等)"]
+    KV[("Kvrocks :6666<br/>RocksDB on disk")]
+
+    SDK -- "精简请求<br/>(哈希 + 增量)" --> GW
+    GW -- "X-Cache-Hash/Expire/Hit" --> SDK
+    GW -- "完整请求" --> BE
+    GW <-. "缓存读写<br/>(Redis 协议)" .-> KV
 ```
 
 **缓存后端:只用 Kvrocks**(硬盘持久化)。不再有进程内 L1 层——按需求精简为单一缓存后端:
