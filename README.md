@@ -50,13 +50,8 @@ OpenResty 三阶段(对应设计文档第 5.3 节):
 ## 2. 目录结构
 
 ```
-tail/                      # 客户端:openai 官方 SDK monkey patch + 辅助算法
-├── openai_patch.py        # ★ 核心:openai SDK monkey patch(指纹校验 + session 隔离 + 自动重试)
-├── protocol.py            # 协议头常量(参考)
-├── hashing.py             # 前缀哈希(token 版 + 字符串版)
-├── segment.py             # segment 切分(m·n=0 约束,供参考/移植)
-├── merkle.py              # Merkle 前缀链(增量 hash,供参考/移植)
-└── backend.py             # 模拟推理服务(测试夹具,e2e 用)
+tail/                      # 客户端
+└── openai_patch.py        # ★ openai 官方 SDK monkey patch(指纹校验 + session 隔离 + 自动重试)
 openresty/                 # ★ 服务端:OpenResty/Lua 网关 + Kvrocks 硬盘缓存
 ├── conf/nginx.conf        # 网关配置(access/header_filter/log 三阶段挂 Lua)
 ├── conf/kvrocks.conf      # Kvrocks 配置(端口 6666,数据落盘)
@@ -154,7 +149,7 @@ python3 -m pytest tests/ -v
 
 ---
 
-## 6. 测试结果(113/113 全过)
+## 6. 测试结果(85/85 全过)
 
 ### Lua 单元测试(54)
 ```
@@ -163,11 +158,8 @@ protocol:  14/14   头部常量/抖动过期/默认配置
 store:     17/17   Kvrocks get/set_sync/set_async/del/过期/超大/命名空间
 ```
 
-### Python 测试(46)
+### Python 测试(18)
 ```
-test_hashing (7)          哈希稳定性/抗碰撞/边界
-test_protocol (5)         协议头常量/抖动过期
-test_segment (16)         segment 切分:基础形态/m·n=0/工具回合/streaming 边缘/展平一致
 test_openai_patch (18)    monkey patch + v2.1 SDK 一致性(见下)
 ```
 
@@ -212,8 +204,6 @@ Kvrocks 真写入 / ★ reload 后仍命中(硬盘持久) / 大前缀 /
 | **服务端 缓存**               | `openresty/lua/kvcache/store.lua`(直连 Kvrocks)   | 第 5.1 节    |
 | **服务端 哈希**               | `openresty/lua/kvcache/hashing.lua`                 | 第 5.2 节    |
 | **客户端 monkey patch**       | `tail/openai_patch.py`(透明,零改动)              | 第 6 章      |
-| 辅助:协议常量                | `tail/protocol.py` / `lua/kvcache/protocol.lua`     | 第 4 章      |
-| 辅助:segment/merkle 算法     | `tail/segment.py` / `tail/merkle.py`(供参考/移植)| v2.1 §3      |
 
 ---
 
