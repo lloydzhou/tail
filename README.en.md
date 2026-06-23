@@ -141,6 +141,37 @@ When the hash is present, `messages` may contain **only the delta**; the gateway
 
 ---
 
+## Compared to the OpenAI Responses API
+
+OpenAI's [Responses API](https://developers.openai.com/api/docs/guides/conversation-state) (2025) also tackles "re-sending the prefix", but with a different approach. The two can be combined.
+
+### Approach difference
+
+| | OpenAI Responses API | Tail |
+|---|---|---|
+| **Where cached** | **OpenAI server-side** storage (`store=true`) | **Gateway + client** side (your own infra) |
+| **Reuse mechanism** | `previous_response_id` chains to the last response | `X-Cache-Hash` negotiation + delta messages |
+| **Vendor lock-in** | **OpenAI only** (response objects live on OpenAI's side) | **Vendor-neutral** (any OpenAI-compatible API: DeepSeek / Qwen / local vLLM etc.) |
+| **Switching models** | ❌ breaks the chain (a prior response isn't available to other models) | ✅ no impact (cache isolated per model) |
+| **Data ownership** | Retained by OpenAI for 30 days ([official policy](https://developers.openai.com/api/docs/guides/your-data)) | **Fully self-controlled** (delete anytime, private deployment) |
+| **Billing** | Even with `previous_response_id`, **all historical input tokens are still billed as input** | Backend receives a complete request; billing unchanged |
+| **Protocol** | Responses API (new protocol, code migration needed) | Chat Completions (**zero change**) |
+
+### When to use which?
+
+- **OpenAI-only and OK with 30-day server-side storage** → Responses API is enough, no Tail needed
+- **Using DeepSeek / Qwen / local vLLM / multiple vendors** → Tail (Responses API doesn't support non-OpenAI)
+- **Compliance requires self-controlled data (finance/healthcare/gov)** → Tail (cache in your own gateway, never touches a third party)
+- **Want to save *uplink bandwidth* rather than *token billing*** → Tail works directly; Responses API saves bandwidth too but relies on server-side impl
+- **The two stack**: use Tail to save uplink, and still use Responses API when the backend is OpenAI
+
+### The essential difference
+
+The Responses API is "**let the vendor hold the state**" — convenient, but vendor lock-in and data residency on the vendor's side.
+Tail is "**hold the state yourself**" — an extra gateway layer, in exchange for self-control, vendor neutrality, and protocol compatibility.
+
+---
+
 ## Key design
 
 1. **v2.1 Segment-Merkle**: messages split into segments by LLM turn, three independent hashes (system/tools/messages), combined `cache_key = sys::tools::pfx`; appending a turn adds O(1) nodes; cross-conversation content-addressed reuse.

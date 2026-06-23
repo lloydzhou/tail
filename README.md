@@ -135,6 +135,37 @@ run.sh                     # 一键启停(Kvrocks + 网关 + 模拟后端,OpenRe
 
 ---
 
+## 与 OpenAI Responses API 对比
+
+OpenAI 2025 年推出的 [Responses API](https://developers.openai.com/api/docs/guides/conversation-state) 也在解决"重复发送前缀"的问题,但思路不同。两者可结合使用。
+
+### 思路差异
+
+| | OpenAI Responses API | Tail |
+|---|---|---|
+| **缓存位置** | OpenAI **服务端**存储(`store=true`) | **网关 + 客户端**侧(你自己的基础设施) |
+| **复用机制** | `previous_response_id` 链式引用上一次响应 | `X-Cache-Hash` 协商 + 增量 messages |
+| **绑定厂商** | **仅 OpenAI**(响应对象存在 OpenAI 侧) | **厂商无关**(任何 OpenAI 兼容 API:DeepSeek/Qwen/本地 vLLM 等) |
+| **换模型** | ❌ 换模型会断链(上一轮响应不可用于其他模型) | ✅ 无影响(缓存按 model 维度隔离) |
+| **数据所有权** | OpenAI 持有 30 天([官方策略](https://developers.openai.com/api/docs/guides/your-data)) | **完全自控**(可立即删除、私有部署) |
+| **计费** | 即使 `previous_response_id`,链上**所有历史 input token 仍按 input 计费** | 后端收到的就是完整请求,计费不变 |
+| **协议兼容** | Responses API(新协议,需改代码迁移) | Chat Completions(**零改动**) |
+
+### 什么时候用哪个?
+
+- **只用 OpenAI、且能接受 30 天服务端存储** → Responses API 够用,无需 Tail
+- **用 DeepSeek / Qwen / 本地 vLLM / 多厂商** → Tail(Responses API 不支持非 OpenAI)
+- **数据合规要求自控(金融/医疗/政企)** → Tail(缓存在你自己的网关,不进第三方)
+- **想省的是"上行带宽"而非"token 计费"** → Tail 直接生效;Responses API 的省带宽效果类似,但依赖服务端实现
+- **两者可叠加**:用 Tail 省上行带宽,同时后端是 OpenAI 时也可用 Responses API
+
+### 本质区别
+
+Responses API 是"**把状态交给厂商保管**"——换取便捷,但锁定厂商、数据留存厂商侧。
+Tail 是"**状态自己管**"——多写一层网关,换来自控、跨厂商、协议兼容。
+
+---
+
 ## 关键设计
 
 1. **v2.1 Segment-Merkle**:messages 按 LLM 回合切 segment,三段独立 hash(system/tools/messages),组合 `cache_key = sys::tools::pfx`;加一段只增 O(1) 节点;跨对话内容寻址复用。
