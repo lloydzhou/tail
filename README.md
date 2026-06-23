@@ -1,243 +1,184 @@
-# Tail —— 传输层 KV Cache 优化系统
+# Tail —— LLM 上行带宽优化网关
 
-> 📖 English: [README.en.md](./README.en.md)
->
 > **Tail** — *Send the tail, the head is cached.*
-> **头部已缓存,只发尾部。**
 >
-> 名字取自每个开发者都熟悉的 `tail -f`:只看新增的几行。Tail 把同样的心智模型用到
-> LLM 请求上——前缀(头部)已在网关缓存,客户端只发增量(尾部),透明节省上行带宽。
->
-> 对应设计文档《传输层 KV Cache优化系统设计文档 v1.0》。在客户端 SDK 与 API 网关之间
-> 引入前缀缓存协商层,以「乐观发送 + 自动降级」策略,透明节省 OpenAI Chat Completions
-> 接口的公网上行带宽,对后端推理服务完全无侵。
+> 名字取自 `tail -f`:只看新增的几行。Tail 把同样的心智模型用到 LLM 请求上——
+> 前缀(头部)已在网关缓存,客户端只发增量(尾部),**透明节省 SDK 与 LLM Gateway 之间的上行带宽**。
 
-两个组件(服务端可选 Python 或 OpenResty,二者 cache_key 逐字节一致、可互换):
-- **客户端**:`tail/openai_patch.py` —— openai 官方 SDK 的 monkey patch(零改动)
-- **服务端(选一)**:
-  - `openresty/lua/kvcache/` —— OpenResty/Lua 网关 + Kvrocks(硬盘)缓存(生产推荐)
-  - `tail/gateway/` —— Python(FastAPI)网关 + Storage 抽象(默认 dbm 零依赖,或 Kvrocks)
+## 这能省多少?
+
+长上下文模型(DeepSeek-V3、Qwen3、Gemini 等已支持 **128K~1M token**)下,多轮对话的请求体里 **95%+ 是重复的前缀**。Tail 只发增量,把它压到接近 0。
+
+以 **1M token 上下文**为例(粗估 1 token ≈ 4 字节,英文为主):
+
+| | 不用 Tail | 用 Tail |
+|---|---|---|
+| 单次请求体 | ~4 MB(完整 messages) | ~2 KB(增量 + hash) |
+| 10 轮对话上行流量 | ~40 MB | ~4 MB(首次)+ 9×2 KB ≈ **4 MB** |
+| 节省 | — | **~90%** |
+| 1000 并发对话 × 日均 10 轮 | ~40 GB/天上行 | ~4 GB/天上行 |
+
+实际节省取决于上下文长度与轮次:上下文越长、轮次越多,节省比例越高(极限情况单轮增量仅占 0.05%,节省 **99.9%**)。对**上行带宽计费敏感**的场景(企业内网→公有云 LLM Gateway、跨境调用、移动端)尤其显著。
 
 ---
 
-## 1. 架构(生产版)
+## 工作原理
 
 ```mermaid
 flowchart LR
-    SDK["openai SDK<br/>(monkey patch)<br/>本地缓存"]
-    GW["OpenResty 网关<br/>(Lua 协商核心)"]
-    BE["推理服务<br/>(DeepSeek 等)"]
-    KV[("Kvrocks :6666<br/>RocksDB on disk")]
-
-    SDK -- "精简请求<br/>(哈希 + 增量)" --> GW
-    GW -- "X-Cache-Hash/Expire/Hit" --> SDK
-    GW -- "完整请求" --> BE
-    GW <-. "缓存读写<br/>(Redis 协议)" .-> KV
+    SDK["客户端 SDK<br/>(openai monkey patch)"] -- "精简请求<br/>(hash + 增量)" --> GW["Tail 网关<br/>(FastAPI / Lua)"]
+    GW -- "X-Cache-Hash/Hit" --> SDK
+    GW -- "完整请求(还原后)" --> BE["LLM 推理服务<br/>(DeepSeek / OpenAI / ...)"]
+    GW <-. "缓存读写" .-> KV[("可插拔存储<br/>默认 dbm / 可选 Redis 等")]
 ```
 
-**缓存后端:只用 Kvrocks**(硬盘持久化)。不再有进程内 L1 层——按需求精简为单一缓存后端:
-Kvrocks 基于 RocksDB,数据**落硬盘**,可存储远超内存容量的前缀缓存;Redis 协议兼容,
-网关用 `lua-resty-redis` / `redis-py` 连接,零额外依赖。
+1. **首次请求**:客户端发完整 messages → 网关缓存前缀 → 返回 `X-Cache-Hash`
+2. **后续请求**:SDK 自动只发增量 + hash → 网关按 hash 还原完整请求 → 转发后端
+3. **乐观发送 + 自动降级**:默认带 hash,缓存未命中则 SDK 自动重发全量(对调用方完全透明)
 
-OpenResty 三阶段(对应设计文档第 5.3 节):
-- `access_by_lua`:同步读 Kvrocks 判定命中 + 请求体改写(允许 cosocket)。
-- `header_filter_by_lua`:注入 `X-Cache-*` 响应头(禁止 cosocket)。
-- `log_by_lua`:用 `ngx.timer.at` 异步写 Kvrocks(此阶段禁止 cosocket)。
+**透明性**:
+- 对**调用方**:openai SDK 用法零改动(`openai_patch.install()` 一行)
+- 对**后端**:收到的是标准完整 OpenAI 请求,无感知
+- 支持 **streaming(SSE)**:网关透明转发流式响应,边收边发不缓冲
 
 ---
 
-## 2. 目录结构
+## 快速开始(Python 版网关)
 
-```
-tail/                      # 客户端 + Python gateway
-├── openai_patch.py        # ★ openai 官方 SDK monkey patch(指纹校验 + session 隔离 + 自动重试)
-└── gateway/               # ★ Python 版网关(FastAPI,与 OpenResty 版可互换)
-    ├── app.py             # FastAPI 路由(三阶段:命中还原/转发/异步写)
-    ├── storage.py         # Storage 抽象 + DbmStorage(零依赖,默认)/ 可插拔 Redis
-    ├── segment.py / merkle.py / hashing.py   # v2.1 算法(与 Lua 哈希逐字节一致)
-    ├── protocol.py        # 常量 + compute_expire + GatewayConfig
-    └── __main__.py        # 命令行入口
-openresty/                 # ★ 服务端:OpenResty/Lua 网关 + Kvrocks 硬盘缓存(v2.1 Segment-Merkle)
-├── conf/nginx.conf        # 网关配置(access/header_filter/log 三阶段挂 Lua)
-├── conf/kvrocks.conf      # Kvrocks 配置(端口 6666,数据落盘)
-├── lua/kvcache/
-│   ├── hashing.lua        # 哈希(字符串 SHA256,导出 encode_message/sha256_hex16)
-│   ├── segment.lua        # ★ v2.1 segment 切分(m·n=0 约束)
-│   ├── merkle.lua         # ★ v2.1 Merkle 前缀链
-│   ├── protocol.lua       # 协议头常量 + 防雪崩抖动 + renew_ttl
-│   ├── store.lua          # ★ v2.1 三段存储(sys/tools/seg/pfx/meta)
-│   ├── gateway.lua        # 协商核心(access 三段还原 / log 三段写)
-│   ├── *_spec.lua         # Lua 单测(hashing/protocol/segment/merkle/store)
-├── run_lua_tests.sh       # 统一 Lua 单测 runner
-└── logs/
-runtime/                   # 本地编译的运行时(gitignore,需自己 build)
-├── openresty/             # OpenResty 1.27 + LuaJIT
-└── kvrocks/bin/kvrocks    # Kvrocks 2.16.0
-tests/                     # 测试(patch 单测 + OpenResty 端到端)
-docs/
-└── DESIGN-chunked-cache.md # v2.1 设计文档(分层 Segment-Merkle + SDK 一致性)
-run.sh                     # 一键启停(Kvrocks + 网关 + 模拟后端)
-```
-
----
-
-## 3. 协议(摘要)
-
-**请求方向**(Client → Gateway):
-
-| Header                      | 含义                                          |
-|-----------------------------|-----------------------------------------------|
-| `X-Cache-Hash`              | 可选。上次响应里的缓存哈希。                   |
-| `X-Cache-Prefix-Length`     | 可选。该哈希对应的前缀消息条数,辅助网关校验。 |
-
-携带哈希时,Body 的 `messages` 可只含**增量**(新增轮次);网关负责还原完整 messages。
-
-**响应方向**(Gateway → Client):
-
-| Header            | 含义                                            |
-|-------------------|-------------------------------------------------|
-| `X-Cache-Hash`    | 本次前缀的新哈希,客户端应保存。                 |
-| `X-Cache-Expire`  | 缓存过期 Unix 时间戳(秒,带 ±jitter 防雪崩)。 |
-| `X-Cache-Hit`     | `true`/`false`,网关层是否命中。                 |
-
----
-
-## 4. 快速开始
-
-### 4.1 一键启动
+### 安装
 
 ```bash
-cd tail   # clone 后进入项目根
-./run.sh start      # 起 Kvrocks(6666)+ 网关(8765)+ 模拟后端(8080)
-./run.sh status     # 查看各服务状态
-./run.sh stop       # 停全部
+pip install tail            # 或 pip install -e . (本仓库)
 ```
 
-### 4.2 用 openai 官方 SDK(透明,代码零改动)
+### 启动网关(一行命令,默认零依赖 dbm 存储)
+
+```bash
+# 后端指向真实推理服务即可
+python -m tail.gateway --backend https://api.deepseek.com --port 8765
+```
+
+可选参数:
+```bash
+python -m tail.gateway --backend https://api.deepseek.com \
+    --storage dbm \              # 默认,零依赖(也可 redis 连外部 KV)
+    --dbm-path ./tail_cache.dbm \
+    --miss-mode fast_fail \      # 未命中:fast_fail(422 重试)| passthrough
+    --port 8765
+```
+
+### 客户端使用(零改动)
 
 ```python
 from tail import openai_patch
-openai_patch.install()        # 装 monkey patch
+openai_patch.install()        # 装一次
 
 from openai import OpenAI
-client = OpenAI(base_url="http://127.0.0.1:8765/v1", api_key="sk-anything")
+client = OpenAI(base_url="http://127.0.0.1:8765/v1", api_key="sk-...")
 
-# 照常用,SDK 自动维护前缀缓存、只发增量、自动降级重试
-client.chat.completions.create(
+# 照常用,SDK 自动维护前缀缓存、只发增量、自动降级
+resp = client.chat.completions.create(
     model="deepseek-chat",
     messages=[{"role": "user", "content": "Hello"}],
 )
+# 流式也透明支持
+stream = client.chat.completions.create(
+    model="deepseek-chat",
+    messages=[...], stream=True,
+)
 ```
 
-### 4.2b 启动 Python 版网关(可选,无需编译 OpenResty)
+---
 
-```bash
-# 默认 dbm 存储(零依赖),后端指向真实推理服务
-python -m tail.gateway --backend https://api.deepseek.com --port 8765
+## 目录结构
 
-# 或连 Kvrocks(与 OpenResty 版共享缓存)
-python -m tail.gateway --backend https://api.deepseek.com --storage redis \
-    --kvrocks-host 127.0.0.1 --kvrocks-port 6666
+```
+tail/                      # 客户端 + Python 网关(主)
+├── openai_patch.py        # ★ openai SDK monkey patch(指纹校验 + session 隔离 + 自动重试)
+└── gateway/               # ★ Python 网关(FastAPI)
+    ├── app.py             # 路由(三阶段:命中还原/透明转发/streaming SSE)
+    ├── storage.py         # Storage 抽象基类 + DbmStorage(零依赖默认)/ 可插拔
+    ├── segment.py / merkle.py / hashing.py   # v2.1 算法(segment 切分 + Merkle 增量链)
+    ├── protocol.py        # 常量 + GatewayConfig
+    └── __main__.py        # 命令行入口(python -m tail.gateway ...)
+
+openresty/                 # (可选)OpenResty/Lua 版网关,与 Python 版 cache_key 逐字节一致、可互换
+├── conf/nginx.conf
+└── lua/kvcache/           # hashing/segment/merkle/protocol/store/gateway
+
+tests/                     # 测试(Python 网关 + patch 单测 + OpenResty 端到端)
+docs/
+└── DESIGN-chunked-cache.md   # 设计文档(v2.1 Segment-Merkle + 访问驱动续期)
+run.sh                     # 一键启停(Kvrocks + 网关 + 模拟后端,OpenResty 版用)
 ```
 
-Python gateway 与 OpenResty gateway 产出的 `cache_key` **逐字节一致**
-(同样的 messages → 同样的 `sys::tools::pfx`),两者可互换或共存。
+---
 
-### 4.3 跑测试
+## 协议(摘要)
+
+**请求方向**(Client → Gateway):
+
+| Header | 含义 |
+|--------|------|
+| `X-Cache-Hash` | 可选。上次响应返回的缓存哈希。 |
+| `X-Cache-Prefix-Length` | 可选。该哈希对应的前缀消息条数。 |
+
+携带哈希时,`messages` 可只含**增量**;网关负责还原完整 messages。
+
+**响应方向**(Gateway → Client):
+
+| Header | 含义 |
+|--------|------|
+| `X-Cache-Hash` | 本次前缀的新哈希,客户端应保存。 |
+| `X-Cache-Expire` | 缓存过期 Unix 时间戳(带 ±jitter 防雪崩)。 |
+| `X-Cache-Hit` | `true`/`false`,网关是否命中。 |
+
+---
+
+## 关键设计
+
+1. **v2.1 Segment-Merkle**:messages 按 LLM 回合切 segment,三段独立 hash(system/tools/messages),组合 `cache_key = sys::tools::pfx`;加一段只增 O(1) 节点;跨对话内容寻址复用。
+2. **访问驱动续期**:缓存节点读一次续一个 TTL,活跃对话链永不过期,沉寂对话自然消亡。
+3. **Storage 抽象**:对齐 7 方法接口,默认 `DbmStorage`(标准库 dbm,零依赖),可插拔 Redis 等。
+4. **SDK 一致性**:前缀指纹校验(防 compact/编辑/重排静默错误)+ 多 session 上下文隔离 + 自动降级全量重发。
+5. **透明 streaming**:SSE 边收边发,不缓冲,`text/event-stream` 原样透传。
+6. **乐观发送 + fast_fail**:默认带 hash,未命中返回 422 由 SDK 重试一次(零额外 RTT)。
+
+详见 `docs/DESIGN-chunked-cache.md`。
+
+---
+
+## 测试
 
 ```bash
-# Lua 单测(只需 OpenResty)
-./openresty/run_lua_tests.sh
+# Python 网关单测 + 端到端(含 streaming SSE)
+python3 -m pytest tests/test_gateway_py.py -v
 
-# patch 单测(纯 Python,无需服务)
+# openai patch 单测(纯 Python)
 python3 -m pytest tests/test_openai_patch.py -v
-
-# OpenResty 端到端(需先 ./run.sh start 起 Kvrocks+网关+后端)
-python3 -m pytest tests/test_openresty_e2e.py -v
 ```
+
+| 层 | 数量 | 覆盖 |
+|----|------|------|
+| Python 网关 | 27 | 算法一致性 / dbm roundtrip / ASGI 端到端 / **streaming SSE 透传** / 缓存命中 |
+| openai patch | 18 | 多轮增量 / 多模型 / compact 降级 / 多 session 隔离 / 重试 |
+| OpenResty 端到端 | 15 | 三段存储 / 命中还原 / reload 持久 / 访问驱动续期 / streaming |
 
 ---
 
-## 5. 关键设计决策
+## 两个网关实现(可互换)
 
-1. **唯一缓存后端 = Kvrocks(硬盘)**:去掉进程内 L1 层,统一用 Kvrocks。
-   数据落硬盘,可存远超内存量;进程重启缓存不丢(reload 后仍命中)。
-2. **Lua 侧用 content 字符串哈希**:Lua 集成 tiktoken 成本高,用 messages 序列化字符串的
-   SHA256(定长编码防边界碰撞),零依赖、最快。
-3. **OpenResty 三阶段分工**:`access`(同步读)/`header_filter`(注入头)/`log`(timer 异步写),
-   规避各阶段的 cosocket 限制。
-4. **缓存未命中默认 fast_fail**:乐观发送下未命中时客户端只发了增量,直接转发会给后端残缺请求;
-   默认返回 422 + `X-Cache-Hit: false`,SDK 用完整 messages 重试一次(第 6.4 节)。
-5. **防雪崩**:过期时间带 ±jitter(第 9 章)。
-6. **降级容错**:网关任何内部异常 fallback 到透传;Kvrocks 不可用时请求不崩(第 5.4 节)。
-7. **v2.1 Segment-Merkle**:messages 按 LLM 回合切 segment,三段独立 hash(sys/tools/pfx),
-   组合 cache_key = `sys::tools::pfx`;加一段只增 O(1) 节点;跨对话内容寻址复用。
-8. **访问驱动续期**(§7.4):pfx 节点读一次续一个 TTL,活跃链永不过期,沉寂链自然消亡。
+| | Python 版(主) | OpenResty 版(可选) |
+|---|---|---|
+| 框架 | FastAPI + uvicorn | OpenResty + Lua |
+| 存储 | dbm(零依赖默认)/ Redis 等 | Kvrocks(硬盘) |
+| 启动 | `python -m tail.gateway --backend URL` | `./run.sh start`(需编译 OpenResty+Kvrocks) |
+| cache_key | **逐字节一致** | **逐字节一致** |
+
+两者产出的 `X-Cache-Hash` 完全相同(同样的 messages → 同样的 `sys::tools::pfx`),可互换或共存。Python 版零依赖开箱即用;OpenResty 版性能更高(适合大流量生产)。
 
 ---
 
-## 6. 测试结果(118/118 全过)
+## License
 
-### Lua 单元测试(85)
-```
-hashing:   23/23   稳定性/抗碰撞/边界/前缀扩展/特殊字符/多模态/超长
-protocol:  14/14   头部常量/抖动过期/默认配置/renew_ttl
-segment:   19/19   ★ v2.1 切分:基础形态/m·n=0/工具回合/streaming 边缘/展平一致
-merkle:    14/14   ★ v2.1 链:segment_hash/chain_step/build_nodes/增量推进
-store:     15/15   ★ v2.1 三段:put_request/reconstruct/缺失段/链断裂/续期
-```
-
-### Python 测试(18)
-```
-test_openai_patch (18)    monkey patch + v2.1 SDK 一致性(见下)
-```
-
-### monkey patch 测试(18,含 v2.1 SDK 一致性)
-```
-基础:install 幂等 / 首次全量 / 二次增量 / 缓存更新 / 自动重试 / 多轮 / 多模型
-v2.1 修复:★ compact 降级全量 / ★ 编辑旧消息降级 / ★ 重排降级 /
-          ★ 多 session contextvars 隔离 / ★ 串行 session 优雅降级 / digest 替代数组
-```
-
-### OpenResty+Kvrocks 端到端(15)
-```
-health / 首次全量 / 命中还原 / miss fast_fail / 多轮新哈希 /
-Kvrocks 真写入 / ★ 访问驱动续期(读后 TTL 刷新) / miss 不续期 /
-★ reload 后仍命中(硬盘持久) / 大前缀 /
-错误 prefix_length / 过期 entry miss / 并发 / 健康端点
-```
-
----
-
-## 7. 编译说明(OpenResty + Kvrocks)
-
-### OpenResty
-源码编译到 `runtime/openresty/`,含 LuaJIT 2.1、resty CLI、lua-resty-* 库。
-
-### Kvrocks
-源码编译 v2.16.0。三个坎(均已解决):
-- 用系统 `librocksdb.so` + 头文件(沙箱网络无法下载 rocksdb 源码),
-  改造 `cmake/rocksdb.cmake` 走系统库。
-- patch jemalloc 5.3.1 与 gcc 16 的不兼容(`std::__throw_bad_alloc`)。
-- 补 `zlib_with_headers` 别名 target(系统库改造后的链接需求)。
-
----
-
-## 8. 组件对应关系(对照设计文档)
-
-| 组件                          | 位置                                                | 设计文档章节 |
-|-------------------------------|-----------------------------------------------------|--------------|
-| **服务端 网关**               | `openresty/lua/kvcache/gateway.lua`                 | 第 5.3 节    |
-| └ access/header_filter/log    | nginx.conf 三阶段                                   | 第 5.3 节    |
-| **服务端 缓存**               | `openresty/lua/kvcache/store.lua`(直连 Kvrocks)   | 第 5.1 节    |
-| **服务端 哈希**               | `openresty/lua/kvcache/hashing.lua`                 | 第 5.2 节    |
-| **客户端 monkey patch**       | `tail/openai_patch.py`(透明,零改动)              | 第 6 章      |
-
----
-
-## 9. 已实现 / 未实现(对照设计文档 Phase)
-
-- ✅ **Phase 1**:网关、哈希、Kvrocks 缓存、Body 改写、单元/端到端测试。
-- ✅ **Phase 2**:SDK 缓存管理、自动降级重试、链路联调(openai 官方 SDK monkey patch)。
-- ✅ **Phase 3(部分)**:Kvrocks 硬盘缓存(现已作为唯一后端);分层 Chunking / 监控告警未含。
-- ⏳ **Phase 4**:协议文档化、Responses API 互操作未含。
+MIT

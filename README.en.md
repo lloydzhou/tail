@@ -1,240 +1,190 @@
-# Tail — Transport-Layer KV Cache Optimization
+# Tail — Uplink Bandwidth Optimizer for LLM Gateways
 
 > **Tail** — *Send the tail, the head is cached.*
 >
-> The name comes from the `tail -f` command every developer knows: show only the
-> newly appended lines. Tail applies the same mental model to LLM requests — the
-> prefix (the head) is already cached at the gateway, so the client sends only the
-> incremental turn (the tail), transparently saving uplink bandwidth.
->
-> Corresponds to the design doc《传输层 KV Cache 优化系统设计文档 v1.0》. It inserts a
-> prefix-cache negotiation layer between the client SDK and the API gateway. Using an
-> **optimistic-send + auto-fallback** strategy, it transparently reduces the uplink
-> payload of OpenAI Chat Completions requests, with **zero invasion** into the backend
-> inference service.
+> The name comes from `tail -f`: show only the newly appended lines. Tail applies
+> the same mental model to LLM requests — the prefix (the head) is already cached at
+> the gateway, so the client sends only the incremental turn (the tail),
+> **transparently saving uplink bandwidth between the SDK and the LLM Gateway**.
 
-Two components:
-- **Client**: `tail/openai_patch.py` — a monkey patch for the official openai SDK (zero code change)
-- **Server**: `openresty/lua/kvcache/` — an OpenResty/Lua gateway with Kvrocks (on-disk) cache
+## How much does it save?
 
-> 📖 中文文档见 [README.md](./README.md)。
+Long-context models (DeepSeek-V3, Qwen3, Gemini — now supporting **128K~1M tokens**)
+make multi-turn request bodies **95%+ repeated prefix**. Tail sends only the delta.
+
+Using a **1M-token context** as an example (~4 bytes/token, mostly English):
+
+| | Without Tail | With Tail |
+|---|---|---|
+| Single request body | ~4 MB (full messages) | ~2 KB (delta + hash) |
+| 10-turn conversation uplink | ~40 MB | ~4 MB (first) + 9×2 KB ≈ **4 MB** |
+| Saving | — | **~90%** |
+| 1000 concurrent convs × 10 turns/day | ~40 GB/day uplink | ~4 GB/day uplink |
+
+The longer the context and the more turns, the higher the ratio (in the limit a single
+delta is ~0.05% — a **99.9%** saving). Especially valuable where **uplink is metered**:
+on-prem → cloud LLM gateway, cross-border calls, mobile clients.
 
 ---
 
-## 1. Architecture (Production)
+## How it works
 
 ```mermaid
 flowchart LR
-    SDK["openai SDK<br/>(monkey patch)<br/>local cache"]
-    GW["OpenResty gateway<br/>(Lua negotiation core)"]
-    BE["Inference service<br/>(DeepSeek, etc.)"]
-    KV[("Kvrocks :6666<br/>RocksDB on disk")]
-
-    SDK -- "slim request<br/>(hash + delta)" --> GW
-    GW -- "X-Cache-Hash/Expire/Hit" --> SDK
-    GW -- "full request" --> BE
-    GW <-. "cache read/write<br/>(Redis protocol)" .-> KV
+    SDK["Client SDK<br/>(openai monkey patch)"] -- "slim request<br/>(hash + delta)" --> GW["Tail gateway<br/>(FastAPI / Lua)"]
+    GW -- "X-Cache-Hash/Hit" --> SDK
+    GW -- "full request (reconstructed)" --> BE["LLM inference<br/>(DeepSeek / OpenAI / ...)"]
+    GW <-. "cache read/write" .-> KV[("pluggable storage<br/>default dbm / optional Redis etc.")]
 ```
 
-**Cache backend: Kvrocks only** (on-disk persistent). There is no in-process L1 layer —
-by design the cache is a single backend. Kvrocks is RocksDB-based, so data **lands on disk**
-and can store far more than memory; it speaks the Redis protocol, so the gateway connects
-with `lua-resty-redis` / `redis-py`, with no extra dependencies.
+1. **First request**: client sends full messages → gateway caches the prefix → returns `X-Cache-Hash`
+2. **Subsequent**: SDK sends only the delta + hash → gateway reconstructs the full request → forwards
+3. **Optimistic send + auto-fallback**: hash is always attached; on a miss the SDK auto-resends the full body (fully transparent to the caller)
 
-OpenResty three phases (design doc §5.3):
-- `access_by_lua`: synchronously read Kvrocks for hit/miss decision + rewrite request body (cosockets allowed here).
-- `header_filter_by_lua`: inject `X-Cache-*` response headers (cosockets forbidden here).
-- `log_by_lua`: write Kvrocks asynchronously via `ngx.timer.at` (cosockets forbidden here).
+**Transparency**:
+- To the **caller**: zero change to openai SDK usage (one `openai_patch.install()` line)
+- To the **backend**: receives a standard, complete OpenAI request — no awareness
+- Supports **streaming (SSE)**: the gateway transparently relays streamed responses, no buffering
 
 ---
 
-## 2. Directory layout
+## Quick start (Python gateway)
 
-```
-tail/                      # Client: openai SDK monkey patch
-└── openai_patch.py        # ★ core: openai SDK monkey patch (digest check + session isolation + auto-retry)
-
-openresty/                 # ★ Server: OpenResty/Lua gateway + Kvrocks on-disk cache (v2.1 Segment-Merkle)
-├── conf/nginx.conf        # gateway config (access/header_filter/log phases wired to Lua)
-├── conf/kvrocks.conf      # Kvrocks config (port 6666, data on disk)
-├── lua/kvcache/
-│   ├── hashing.lua        # hashing (string SHA256; exports encode_message/sha256_hex16)
-│   ├── segment.lua        # ★ v2.1 segment splitting (m·n=0 constraint)
-│   ├── merkle.lua         # ★ v2.1 Merkle prefix chain
-│   ├── protocol.lua       # protocol header constants + anti-avalanche jitter + renew_ttl
-│   ├── store.lua          # ★ v2.1 three-segment storage (sys/tools/seg/pfx/meta)
-│   ├── gateway.lua        # negotiation core (access reconstruct / log write)
-│   ├── *_spec.lua         # Lua unit tests (hashing/protocol/segment/merkle/store)
-├── run_lua_tests.sh       # unified Lua test runner
-└── logs/
-runtime/                   # locally compiled runtime (gitignored; build it yourself)
-├── openresty/             # OpenResty 1.27 + LuaJIT
-└── kvrocks/bin/kvrocks    # Kvrocks 2.16.0
-tests/                     # tests (patch unit tests + OpenResty e2e)
-docs/
-└── DESIGN-chunked-cache.md # v2.1 design doc (Segment-Merkle + SDK consistency)
-run.sh                     # one-shot start/stop (Kvrocks + gateway + mock backend)
-```
-
----
-
-## 3. Protocol (summary)
-
-**Request direction** (Client → Gateway), custom headers:
-
-| Header                      | Meaning                                                  |
-|-----------------------------|----------------------------------------------------------|
-| `X-Cache-Hash`              | Optional. The cache hash returned in the last response.  |
-| `X-Cache-Prefix-Length`     | Optional. Number of prefix messages that hash covers; helps the gateway validate. |
-
-When the hash is present, the body's `messages` may contain **only the delta** (new turns);
-the gateway reconstructs the full messages.
-
-**Response direction** (Gateway → Client), custom headers:
-
-| Header            | Meaning                                                          |
-|-------------------|------------------------------------------------------------------|
-| `X-Cache-Hash`    | The new hash for this prefix; the client should store it.        |
-| `X-Cache-Expire`  | Cache expiry as a Unix timestamp (seconds, with ±jitter).        |
-| `X-Cache-Hit`     | `true`/`false` — whether the gateway cache hit on this request.  |
-
----
-
-## 4. Quick start
-
-### 4.1 One-shot start
+### Install
 
 ```bash
-cd tail   # enter the project root after cloning
-./run.sh start      # start Kvrocks (6666) + gateway (8765) + mock backend (8080)
-./run.sh status     # show service status
-./run.sh stop       # stop all
+pip install tail            # or: pip install -e . (this repo)
 ```
 
-### 4.2 Using the official openai SDK (transparent, zero code change)
+### Start the gateway (one line, zero-dependency dbm by default)
+
+```bash
+# Point the backend at any real inference service
+python -m tail.gateway --backend https://api.deepseek.com --port 8765
+```
+
+Optional flags:
+```bash
+python -m tail.gateway --backend https://api.deepseek.com \
+    --storage dbm \              # default, zero-dep (or: redis for external KV)
+    --dbm-path ./tail_cache.dbm \
+    --miss-mode fast_fail \      # on miss: fast_fail (422 retry) | passthrough
+    --port 8765
+```
+
+### Client usage (zero change)
 
 ```python
 from tail import openai_patch
-openai_patch.install()        # install the monkey patch
+openai_patch.install()        # install once
 
 from openai import OpenAI
-client = OpenAI(base_url="http://127.0.0.1:8765/v1", api_key="sk-anything")
+client = OpenAI(base_url="http://127.0.0.1:8765/v1", api_key="sk-...")
 
 # Use it normally — the SDK maintains the prefix cache, sends only the delta,
-# and falls back to a full resend automatically on miss.
-client.chat.completions.create(
+# and falls back to a full resend automatically.
+resp = client.chat.completions.create(
     model="deepseek-chat",
     messages=[{"role": "user", "content": "Hello"}],
 )
+# Streaming is transparently supported too
+stream = client.chat.completions.create(
+    model="deepseek-chat",
+    messages=[...], stream=True,
+)
 ```
 
-### 4.3 Running tests
+---
+
+## Directory layout
+
+```
+tail/                      # client + Python gateway (primary)
+├── openai_patch.py        # ★ openai SDK monkey patch (digest check + session isolation + auto-retry)
+└── gateway/               # ★ Python gateway (FastAPI)
+    ├── app.py             # route (three phases: hit-reconstruct / transparent-forward / streaming SSE)
+    ├── storage.py         # Storage abstract base + DbmStorage (zero-dep default) / pluggable
+    ├── segment.py / merkle.py / hashing.py   # v2.1 algorithms (segment split + Merkle incremental chain)
+    ├── protocol.py        # constants + GatewayConfig
+    └── __main__.py        # CLI entry (python -m tail.gateway ...)
+
+openresty/                 # (optional) OpenResty/Lua gateway; cache_key byte-identical & interchangeable with Python
+├── conf/nginx.conf
+└── lua/kvcache/
+
+tests/                     # tests (Python gateway + patch unit + OpenResty e2e)
+docs/
+└── DESIGN-chunked-cache.md   # design doc (v2.1 Segment-Merkle + access-driven renewal)
+run.sh                     # one-shot start/stop (used by the OpenResty build)
+```
+
+---
+
+## Protocol (summary)
+
+**Request** (Client → Gateway):
+
+| Header | Meaning |
+|--------|---------|
+| `X-Cache-Hash` | Optional. The cache hash returned in the last response. |
+| `X-Cache-Prefix-Length` | Optional. Number of prefix messages that hash covers. |
+
+When the hash is present, `messages` may contain **only the delta**; the gateway reconstructs the full messages.
+
+**Response** (Gateway → Client):
+
+| Header | Meaning |
+|--------|---------|
+| `X-Cache-Hash` | The new hash for this prefix; the client should store it. |
+| `X-Cache-Expire` | Cache expiry as a Unix timestamp (with ±jitter, anti-avalanche). |
+| `X-Cache-Hit` | `true`/`false` — whether the gateway cache hit. |
+
+---
+
+## Key design
+
+1. **v2.1 Segment-Merkle**: messages split into segments by LLM turn, three independent hashes (system/tools/messages), combined `cache_key = sys::tools::pfx`; appending a turn adds O(1) nodes; cross-conversation content-addressed reuse.
+2. **Access-driven renewal**: a cache node read renews its TTL — active chains never expire, idle chains fade away.
+3. **Storage abstraction**: a 7-method interface; default `DbmStorage` (stdlib dbm, zero-dep), pluggable Redis etc.
+4. **SDK consistency**: prefix-digest verification (prevents silent errors on compact/edit/reorder) + multi-session context isolation + auto-fallback to full resend.
+5. **Transparent streaming**: SSE relayed chunk-by-chunk, no buffering, `text/event-stream` preserved.
+6. **Optimistic send + fast_fail**: hash always attached; on miss returns 422 and the SDK retries once (zero extra RTT).
+
+See `docs/DESIGN-chunked-cache.md` for details.
+
+---
+
+## Tests
 
 ```bash
-# Lua unit tests (only needs OpenResty)
-./openresty/run_lua_tests.sh
+# Python gateway unit + e2e (incl. streaming SSE)
+python3 -m pytest tests/test_gateway_py.py -v
 
-# patch unit tests (pure Python, no services needed)
+# openai patch unit (pure Python)
 python3 -m pytest tests/test_openai_patch.py -v
-
-# OpenResty e2e (requires ./run.sh start first: Kvrocks + gateway + backend)
-python3 -m pytest tests/test_openresty_e2e.py -v
 ```
+
+| Layer | Count | Coverage |
+|-------|-------|----------|
+| Python gateway | 27 | algo consistency / dbm roundtrip / ASGI e2e / **streaming SSE passthrough** / cache hit |
+| openai patch | 18 | multi-turn delta / multi-model / compact fallback / multi-session isolation / retry |
+| OpenResty e2e | 15 | three-segment storage / hit reconstruct / reload persistence / access-driven renewal / streaming |
 
 ---
 
-## 5. Key design decisions
+## Two gateway implementations (interchangeable)
 
-1. **Single cache backend = Kvrocks (on-disk)**. No in-process L1 layer — by design the
-   cache is unified on Kvrocks. Data lands on disk, survives process restarts, and can
-   hold far more than RAM.
-2. **Lua-side uses content-string hashing** instead of BPE token hashing. Integrating
-   tiktoken into Lua is heavy; instead we SHA-256 the stable serialization of messages
-   (length-prefixed encoding to prevent boundary collisions) — zero dependencies, fastest.
-3. **OpenResty three-phase split**: `access` (sync read) / `header_filter` (inject headers) /
-   `log` (timer async write) — working around the cosocket restrictions of each phase.
-4. **Cache miss defaults to fast_fail**. With optimistic send, a miss means the client only
-   sent the delta; forwarding that directly would give the backend an incomplete request.
-   So the gateway returns 422 + `X-Cache-Hit: false`, and the SDK resends the full messages
-   once (§6.4). `passthrough` mode is available as the doc-literal alternative.
-5. **Anti-avalanche**: expiry timestamps carry ±jitter (§9).
-6. **Graceful fallback**: any internal gateway error falls back to passthrough; if Kvrocks is
-   unreachable, requests do not crash (§5.4).
-7. **v2.1 Segment-Merkle**: messages are split by LLM turn into segments, with three
-   independent hashes (sys/tools/pfx). The combined `cache_key = sys::tools::pfx`; appending
-   one turn adds only O(1) nodes; cross-conversation content-addressed reuse.
-8. **Access-driven renewal** (§7.4): each pfx node read renews its TTL — active chains never
-   expire, idle chains fade away naturally.
+| | Python (primary) | OpenResty (optional) |
+|---|---|---|
+| Framework | FastAPI + uvicorn | OpenResty + Lua |
+| Storage | dbm (zero-dep default) / Redis etc. | Kvrocks (on-disk) |
+| Start | `python -m tail.gateway --backend URL` | `./run.sh start` (build OpenResty+Kvrocks first) |
+| cache_key | **byte-identical** | **byte-identical** |
+
+Both produce the exact same `X-Cache-Hash` (same messages → same `sys::tools::pfx`) and are interchangeable or coexistable. The Python build runs zero-dependency out of the box; the OpenResty build is higher-performance for heavy production traffic.
 
 ---
 
-## 6. Test results (118/118 passing)
+## License
 
-### Lua unit tests (85)
-```
-hashing:   23/23   stability / anti-collision / boundary / prefix-growth / unicode / multimodal / long
-protocol:  14/14   header constants / jittered expiry / defaults / renew_ttl
-segment:   19/19   ★ v2.1 splitting: basic forms / m·n=0 / tool turns / streaming edge / flatten-match
-merkle:    14/14   ★ v2.1 chain: segment_hash / chain_step / build_nodes / incremental advance
-store:     15/15   ★ v2.1 three-segment: put_request / reconstruct / missing-segment / broken-chain / renewal
-```
-
-### Python tests (18)
-```
-test_openai_patch (18)    monkey patch + v2.1 SDK consistency (see below)
-```
-
-### monkey patch tests (18, incl. v2.1 SDK consistency)
-```
-basic: install idempotent / first full / second delta / cache update / auto-retry / multi-turn / multi-model
-v2.1 fixes: ★ compact falls back to full / ★ edit-old-message falls back / ★ reorder falls back /
-            ★ multi-session contextvars isolation / ★ serial session graceful fallback / digest replaces array
-```
-
-### OpenResty+Kvrocks e2e (15)
-```
-health / first full / hit reconstruct / miss fast_fail / multi-turn new hash /
-Kvrocks actually stored / ★ access-driven TTL renewal / miss does not renew /
-★ survives gateway reload (on-disk persistence) / large prefix /
-wrong prefix_length / expired entry miss / concurrency / health endpoint
-```
-
----
-
-## 7. Build instructions (OpenResty + Kvrocks)
-
-The `runtime/` directory is gitignored — anyone cloning must build both runtimes. See
-`docs/DESIGN-chunked-cache.md` and the commit history for details.
-
-### OpenResty
-Compiled from source into `runtime/openresty/`, including LuaJIT 2.1, the resty CLI, and
-the lua-resty-* libraries.
-
-### Kvrocks
-Compiled from source (v2.16.0). Three hurdles (all resolved in this repo):
-- Uses the system `librocksdb.so` + headers (the sandbox network couldn't download the
-  rocksdb source tarball); `cmake/rocksdb.cmake` was patched to use the system library.
-- Patched jemalloc 5.3.1 for gcc 16 incompatibility (`std::__throw_bad_alloc`).
-- Added a `zlib_with_headers` alias target (a linking requirement after the system-lib switch).
-
----
-
-## 8. Component mapping (vs. the design doc)
-
-| Component                     | Location                                           | Design doc |
-|-------------------------------|----------------------------------------------------|------------|
-| **Server gateway**            | `openresty/lua/kvcache/gateway.lua`                | §5.3       |
-| └ access/header_filter/log    | nginx.conf three phases                            | §5.3       |
-| **Server cache**              | `openresty/lua/kvcache/store.lua` (Kvrocks direct) | §5.1       |
-| **Server hashing**            | `openresty/lua/kvcache/hashing.lua`                | §5.2       |
-| **Client monkey patch**       | `tail/openai_patch.py` (transparent, zero-change)  | §6         |
-
----
-
-## 9. Implemented / not implemented (vs. design doc phases)
-
-- ✅ **Phase 1**: gateway, hashing, Kvrocks cache, body rewrite, unit + e2e tests.
-- ✅ **Phase 2**: SDK cache management, auto-fallback retry, integration (openai SDK monkey patch).
-- ✅ **Phase 3 (partial)**: Kvrocks on-disk cache (now the single backend); v2.1 Segment-Merkle;
-  access-driven renewal. Layered chunking / monitoring / hash-legitimacy checks not included.
-- ⏳ **Phase 4**: protocol documentation, Responses API interop not included.
+MIT
