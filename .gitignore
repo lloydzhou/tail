@@ -1,0 +1,45 @@
+# ===== 编译产物 / 运行时二进制 =====
+# OpenResty + Kvrocks 源码编译产物(任何人都应自己 build,见 README §编译说明)
+build/
+runtime/
+
+# ===== Python =====
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+*.egg-info/
+.eggs/
+dist/
+build/                  # 双保险(setuptools 产物也排除)
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+.tox/
+.venv/
+venv/
+env/
+
+# ===== OpenResty / Kvrocks 运行时数据 =====
+openresty/logs/*.log
+openresty/logs/*.pid
+openresty/logs/*.stdout
+runtime/kvrocks-data/
+
+# ===== 编辑器 / 系统 =====
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db
+
+# ===== 临时文件 =====
+*.tmp
+*.bak
+*.orig
+/tmp/
