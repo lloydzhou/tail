@@ -48,6 +48,7 @@ class GatewayConfig:
         renew_ttl: int = DEFAULT_RENEW_TTL,
         ttl_stable: int = DEFAULT_STABLE_TTL,
         hash_ns: str = DEFAULT_HASH_NS,
+        debug: bool = False,
     ):
         self.backend_url = backend_url.rstrip("/")
         self.miss_mode = miss_mode
@@ -56,3 +57,4 @@ class GatewayConfig:
         self.renew_ttl = renew_ttl
         self.ttl_stable = ttl_stable
         self.hash_ns = hash_ns
+        self.debug = debug

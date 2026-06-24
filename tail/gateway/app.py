@@ -60,11 +60,18 @@ def build_app(cfg: protocol.GatewayConfig, storage: Storage,
         hit = False
 
         # ---- 3. 命中判定 + 还原(等价 access_phase)----
+        if cfg.debug and not cache_key:
+            logger.info("[debug] 首次请求(无 cache_key),发完整 messages=%d 条 → 将建缓存", len(messages))
         if cache_key:
             meta = storage.get_meta(cache_key)
             consistent = (meta is not None
                           and declared_len is not None
                           and meta.get("len") == declared_len)
+            if cfg.debug:
+                logger.info(
+                    "[debug] cache_key=%s meta_found=%s declared_len=%s meta_len=%s consistent=%s",
+                    cache_key, meta is not None, declared_len,
+                    meta.get("len") if meta else None, consistent)
             if consistent:
                 # 还原三段
                 sys_val = storage.get_segment_field("sys", meta["sys_hash"])
@@ -78,6 +85,14 @@ def build_app(cfg: protocol.GatewayConfig, storage: Storage,
                     # 拼装完整 messages = prefix + 增量
                     final_messages = list(prefix_msgs) + list(messages)
                     hit = True
+                    if cfg.debug:
+                        import json as _json
+                        prefix_summary = [{"role": m.get("role"), "content": str(m.get("content", ""))[:40]} for m in prefix_msgs]
+                        delta_summary = [{"role": m.get("role"), "content": str(m.get("content", ""))[:40]} for m in messages]
+                        logger.info("[debug] ★ CACHE HIT — 从缓存还原前缀 %d 条 + 客户端增量 %d 条 = 转发后端 %d 条",
+                                    len(prefix_msgs), len(messages), len(final_messages))
+                        logger.info("[debug]   缓存的前缀(从 storage 还原): %s", _json.dumps(prefix_summary, ensure_ascii=False))
+                        logger.info("[debug]   客户端发的增量: %s", _json.dumps(delta_summary, ensure_ascii=False))
                     if body:
                         body["messages"] = final_messages
                         if sys_val is not None:
@@ -89,6 +104,11 @@ def build_app(cfg: protocol.GatewayConfig, storage: Storage,
                                 pass
             else:
                 # 未命中
+                if cfg.debug:
+                    logger.info("[debug] ✗ CACHE MISS — 原因: %s",
+                                "meta 不存在" if meta is None else
+                                ("未声明 prefix_length" if declared_len is None else
+                                 f"len 不匹配(meta={meta.get('len')} vs declared={declared_len})"))
                 if cfg.miss_mode != MISS_PASSTHROUGH:
                     return _fast_fail(cfg)
 
@@ -131,6 +151,10 @@ def build_app(cfg: protocol.GatewayConfig, storage: Storage,
         if request.app.state.backend_transport is not None:
             client_kwargs["transport"] = request.app.state.backend_transport
 
+        if cfg.debug:
+            is_stream = bool(body.get("stream", False)) if body else False
+            logger.info("[debug] → 转发后端 %s (stream=%s, messages=%d 条)",
+                        f"{cfg.backend_url}/v1/chat/completions", is_stream, len(final_messages))
         try:
             # stream=True:不缓冲整个响应,SSE 字节流逐块透传
             client = httpx.AsyncClient(**client_kwargs)
@@ -148,7 +172,13 @@ def build_app(cfg: protocol.GatewayConfig, storage: Storage,
         if 200 <= upstream.status_code < 300:
             async def _write():
                 try:
-                    storage.put_request(request_snapshot, expire)
+                    new_key = storage.put_request(request_snapshot, expire)
+                    if cfg.debug:
+                        logger.info("[debug] ✓ STORED — 缓存写入完成,新 cache_key=%s (system=%s, tools=%s, %d 条 messages)",
+                                    new_key,
+                                    "有" if request_snapshot.get("system") else "无",
+                                    str(len(request_snapshot["tools"])) if request_snapshot.get("tools") else "无",
+                                    len(request_snapshot.get("messages", [])))
                 except Exception:
                     logger.exception("async put_request failed")
             try:

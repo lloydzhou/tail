@@ -57,16 +57,21 @@ def main(argv=None) -> None:
     parser.add_argument("--kvrocks-port", type=int, default=6666)
     parser.add_argument("--miss-mode", default="fast_fail",
                         choices=["fast_fail", "passthrough"])
-    parser.add_argument("--log-level", default="info")
+    parser.add_argument("--debug", action="store_true",
+                        help="开启详细 debug 日志(缓存命中/未命中/存储内容)")
+    parser.add_argument("--log-level", default=None,
+                        help="日志级别(默认 debug 开时为 DEBUG,否则 INFO)")
     args = parser.parse_args(argv)
 
-    logging.basicConfig(level=args.log_level.upper(),
+    log_level = args.log_level or ("DEBUG" if args.debug else "INFO")
+    logging.basicConfig(level=log_level.upper(),
                         format="%(asctime)s [%(levelname)s] %(name)s: %(message)s")
 
     cfg = GatewayConfig(
         backend_url=args.backend,
         miss_mode=args.miss_mode,
         hash_ns=os.environ.get("TAIL_HASH_NS", "prefix_cache"),
+        debug=args.debug,
     )
     storage = _make_storage(cfg, args)
     app = build_app(cfg, storage)
