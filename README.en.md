@@ -9,10 +9,10 @@
 
 ## How much does it save?
 
-Long-context models (DeepSeek-V3, Qwen3, Gemini — now supporting **128K~1M tokens**)
+Long-context models (e.g. **DeepSeek V4**, **GLM-5.2** — now defaulting to **1M tokens**)
 make multi-turn request bodies **95%+ repeated prefix**. Tail sends only the delta.
 
-Using a **1M-token context** as an example (~4 bytes/token, mostly English):
+Using a **1M-token context** as an example (DeepSeek V4 / GLM-5.2 default to 1M; ~4 bytes/token, mostly English):
 
 | | Without Tail | With Tail |
 |---|---|---|
