@@ -93,11 +93,27 @@ def build_app(cfg: protocol.GatewayConfig, storage: Storage,
                     return _fast_fail(cfg)
 
         # ---- 4. 透明代理转发(streaming 友好:用 stream 边收边发,不缓冲)----
-        fwd_headers = {
-            k: v for k, v in request.headers.items()
-            if k.lower() not in (HEADER_CACHE_HASH.lower(),
-                                 HEADER_CACHE_PREFIX_LENGTH.lower())
+        # 剥离:网关内部缓存头 + hop-by-hop 头 + host(后端按自己域名解析)
+        #       + 空的 Authorization(客户端占位 key,避免 "Bearer " 非法值)
+        _skip_req = {
+            HEADER_CACHE_HASH.lower(), HEADER_CACHE_PREFIX_LENGTH.lower(),
+            "host", "content-length", "transfer-encoding", "connection",
+            "keep-alive", "te", "trailers", "upgrade",
         }
+        fwd_headers = {}
+        for k, v in request.headers.items():
+            kl = k.lower()
+            if kl in _skip_req:
+                continue
+            # 空的 Bearer(客户端占位 api_key)不透传,避免后端报 "Illegal header value b'Bearer '"
+            if kl == "authorization":
+                # 仅保留有实际 token 的 Authorization;"Bearer " / "Bearer" 视为空
+                token_part = v.strip()
+                if token_part.lower().startswith("bearer"):
+                    token_part = token_part[6:].strip()  # 去 "Bearer" 前缀
+                if not token_part:
+                    continue  # 空 token,跳过
+            fwd_headers[k] = v
         # 预算 cache_key(header_filter 等价,纯算无需网络)
         expire = protocol.compute_expire(cfg.ttl, cfg.jitter)
         request_snapshot = {

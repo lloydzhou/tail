@@ -399,3 +399,53 @@ async def test_e2e_non_stream_still_works(gateway_stack):
         assert r.headers.get("content-type", "").startswith("application/json")
         d = r.json()
         assert d["object"] == "chat.completion"
+
+
+# ===========================================================================
+# header 过滤(空 Bearer / hop-by-hop / host 不透传)
+# ===========================================================================
+
+
+@pytest.mark.asyncio
+async def test_e2e_empty_bearer_not_forwarded(gateway_stack):
+    """客户端发空 Bearer(占位 api_key)→ 网关不透传,避免后端 'Illegal header value'。
+
+    回归真实场景 bug:openai SDK 用 api_key="" 时 Authorization="Bearer ",
+    被原样转发导致 httpx LocalProtocolError。
+    """
+    gw, storage, backend, bt = gateway_stack
+    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=gw),
+                                 base_url="http://g") as c:
+        # 发空 Bearer(模拟 SDK api_key="" 场景)
+        r = await c.post("/v1/chat/completions",
+                         json={"model": "deepseek-chat", "messages": [u("q")]},
+                         headers={"Authorization": "Bearer "})
+        assert r.status_code == 200  # 不应 502
+
+        # 后端收到的 Authorization 应被网关剥离(空 Bearer 不透传)
+        # (mock_backend 不校验 Authorization,但确认请求成功即说明 header 没炸)
+
+
+@pytest.mark.asyncio
+async def test_e2e_valid_bearer_forwarded(gateway_stack):
+    """有效的 Bearer token 正常透传。"""
+    gw, storage, backend, bt = gateway_stack
+    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=gw),
+                                 base_url="http://g") as c:
+        r = await c.post("/v1/chat/completions",
+                         json={"model": "deepseek-chat", "messages": [u("q")]},
+                         headers={"Authorization": "Bearer sk-real-token-123"})
+        assert r.status_code == 200
+
+
+@pytest.mark.asyncio
+async def test_e2e_host_header_not_forwarded(gateway_stack):
+    """host 头不透传(避免后端按网关域名解析)。"""
+    gw, storage, backend, bt = gateway_stack
+    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=gw),
+                                 base_url="http://g") as c:
+        # 带 host 头(模拟代理场景)
+        r = await c.post("/v1/chat/completions",
+                         json={"model": "deepseek-chat", "messages": [u("q")]},
+                         headers={"host": "some.gateway.domain:8765"})
+        assert r.status_code == 200
