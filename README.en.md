@@ -68,7 +68,7 @@ Optional flags:
 python -m tail.gateway --backend https://api.deepseek.com \
     --storage dbm \              # default, zero-dep (or: redis for external KV)
     --dbm-path ./tail_cache.dbm \
-    --miss-mode fast_fail \      # on miss: fast_fail (422 retry) | passthrough
+    --miss-mode fast_fail \      # on miss: fast_fail (412 retry) | passthrough
     --port 8765
 ```
 
@@ -179,7 +179,7 @@ Tail is "**hold the state yourself**" — an extra gateway layer, in exchange fo
 3. **Storage abstraction**: a 7-method interface; default `DbmStorage` (stdlib dbm, zero-dep), pluggable Redis etc.
 4. **SDK consistency**: prefix-digest verification (prevents silent errors on compact/edit/reorder) + multi-session context isolation + auto-fallback to full resend.
 5. **Transparent streaming**: SSE relayed chunk-by-chunk, no buffering, `text/event-stream` preserved.
-6. **Optimistic send + fast_fail**: hash always attached; on miss returns 422 and the SDK retries once (zero extra RTT).
+6. **Optimistic send + fast_fail**: hash always attached; on miss returns 412 and the SDK retries once (zero extra RTT).
 
 See `docs/DESIGN-chunked-cache.md` for details.
 

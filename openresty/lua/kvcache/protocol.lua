@@ -19,7 +19,7 @@ M.DEFAULT_RENEW_TTL = 30 * 60             -- 访问驱动续期 TTL(秒),见 §7
 M.DEFAULT_STABLE_TTL = 24 * 3600          -- sys/tools/seg 稳定内容 TTL(秒)
 
 -- 缓存未命中处理模式
-M.MISS_FAST_FAIL = "fast_fail"            -- 默认:不转发,返回 422 由 SDK 重试
+M.MISS_FAST_FAIL = "fast_fail"            -- 默认:不转发,返回 412 由 SDK 重试
 M.MISS_PASSTHROUGH = "passthrough"        -- 文档字面:把当前 messages 当完整转发
 
 -- 读取运行时配置(从 nginx.conf 的 set $var 注入),带默认值兜底。

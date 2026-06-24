@@ -22,7 +22,7 @@ DEFAULT_STABLE_TTL = 24 * 3600            # sys/tools/seg 稳定内容 TTL(秒)
 DEFAULT_HASH_NS = "prefix_cache"          # key 命名空间
 
 # 缓存未命中处理模式
-MISS_FAST_FAIL = "fast_fail"              # 默认:不转发,返回 422 由 SDK 重试
+MISS_FAST_FAIL = "fast_fail"              # 默认:不转发,返回 412 由 SDK 重试
 MISS_PASSTHROUGH = "passthrough"          # 文档字面:把当前 messages 当完整请求转发
 
 

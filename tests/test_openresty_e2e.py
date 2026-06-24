@@ -190,11 +190,11 @@ def test_cache_hit_reconstructs_full_messages(stack):
 
 
 def test_cache_miss_fast_fail(stack):
-    """未命中(fast_fail):不转发后端,返回 422。"""
+    """未命中(fast_fail):不转发后端,返回 412。"""
     before = len(_backend_received())
     r = _chat([{"role": "user", "content": "only incremental"}],
               cache_hash="nonexistent_hash", prefix_length=99)
-    assert r.status_code == 422
+    assert r.status_code == 412
     assert r.headers["X-Cache-Hit"] == "false"
     assert len(_backend_received()) == before  # 后端未被调用
 
@@ -296,9 +296,9 @@ def test_miss_does_not_renew(stack):
     import redis
     r = redis.Redis(host="127.0.0.1", port=6666)
     fake = "nonexistent_renew_check"
-    # 用不存在的 hash 发增量 → miss(fast_fail 422)→ 不该有续期
+    # 用不存在的 hash 发增量 → miss(fast_fail 412)→ 不该有续期
     resp = _chat([{"role": "user", "content": "inc"}], cache_hash=fake, prefix_length=1)
-    assert resp.status_code == 422
+    assert resp.status_code == 412
     # 该 key 不存在(没写过),TTL 查询返回 -2
     assert r.ttl(f"prefix_cache:{fake}") == -2
 
@@ -349,7 +349,7 @@ def test_wrong_prefix_length_is_miss(stack):
     import time as _t; _t.sleep(0.5)
     # 故意给错的 prefix_length(真实=1,给 9)
     r2 = _chat([{"role": "user", "content": "x"}], cache_hash=h, prefix_length=9)
-    assert r2.status_code == 422
+    assert r2.status_code == 412
     assert r2.headers["X-Cache-Hit"] == "false"
 
 
@@ -368,10 +368,10 @@ def test_expired_entry_in_kvrocks_is_miss(stack):
         "expire_at": int(_t.time()) - 1000,  # 已过期
     }
     r.set(f"prefix_cache:{fake_hash}", json.dumps(expired_entry), ex=3600)
-    # 用这个过期哈希发增量 → 应 miss(422)
+    # 用这个过期哈希发增量 → 应 miss(412)
     resp = _chat([{"role": "user", "content": "inc"}],
                  cache_hash=fake_hash, prefix_length=1)
-    assert resp.status_code == 422
+    assert resp.status_code == 412
     assert resp.headers["X-Cache-Hit"] == "false"
     r.delete(f"prefix_cache:{fake_hash}")
 

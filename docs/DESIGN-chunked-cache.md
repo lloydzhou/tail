@@ -229,12 +229,12 @@ SDK 侧唯一要做的是:按 messages 总条数切增量,带 `X-Cache-Prefix-Le
 
 ```
 1. cache_key = req.header["X-Cache-Hash"]
-2. meta = kv.get("meta:" + cache_key);  nil → fast_fail 422
+2. meta = kv.get("meta:" + cache_key);  nil → fast_fail 412
 3. 逐段验证 + 还原:
    - sys:    meta.sys_hash != "0" ? kv.get("sys:"+sys_hash) : null
    - tools:  meta.tools_hash != "0" ? kv.get("tools:"+tools_hash) : null
    - msgs:   reconstruct(meta.pfx_hash)         # §3.6
-4. 任一段缺失/还原失败 → 整体 miss(fast_fail 422)
+4. 任一段缺失/还原失败 → 整体 miss(fast_fail 412)
 5. 全命中 → body.system = sys(若有); body.tools = tools(若有);
             body.messages = reconstructed + 增量
 6. set_body_data, clear 内部 header, proxy_pass
@@ -368,6 +368,45 @@ def _get_table():
 - 网关拿到完整/增量 messages 后,自己切 segment、算 Merkle
 - SDK 的指纹校验保证"发出去的增量确实是对应前缀的延伸",网关才能正确还原
 
+### 5.7 缓存 miss 的 412 异常捕获与重试(关键修复)
+
+**问题**:网关缓存 miss 时返回 412(Precondition Failed)。openai SDK 对非 2xx
+响应**直接抛 APIStatusError 异常**,如果 SDK patch 的重试逻辑写在 `_orig_request`
+调用之后,异常会冒泡,**重试分支永远不执行**——用户看到的就是裸的 412 错误。
+
+**根因场景**:
+- 网关重启(dbm 缓存丢失 / 进程被杀)
+- 客户端本地缓存的 hash 仍然有效(未过期),但网关侧已无对应 meta
+- SDK 发了增量 + hash → 网关 412 → SDK 抛异常 → 用户报错
+
+**修复**:`_patched_request` 必须 `try/except` 包住 `_orig_request`:
+
+```
+try:
+    resp = _orig_request(...)
+except APIStatusError as exc:
+    if sent_increment and _is_miss_exception(exc):
+        # 失效本地缓存,还原完整 messages,全量重试一次
+        _cache_mgr.invalidate(key)
+        options.json_data = json_data  # 原始完整 messages
+        _strip_cache_headers(options)
+        resp = _orig_request(...)
+    else:
+        raise  # 非 miss 异常,原样抛出
+```
+
+**`_is_miss_exception` 判定**:检查 `exc.response.headers` 的
+`X-Cache-Hit: false` 或 status_code ∈ {412, 422}。
+
+**为什么用 412 而非 422**:
+- 422 = Unprocessable Entity(校验错误),语义不准
+- **412 = Precondition Failed**(HTTP 标准):`X-Cache-Hash` 本质是条件请求头
+  (类似 `If-Match`),网关验证不通过返回 412,最语义正确
+  ([MDN](https://developer.mozilla.org/en-US/docs/Web/HTTP/Reference/Status))
+
+**核心原则**:无论状态码是 412 还是 422,SDK 都必须 catch 异常并重试——
+状态码只是语义标记,容错逻辑不能依赖具体码值。
+
 ## 6. 请求处理流程
 
 ### 6.1 写入(log_by_lua,异步)
@@ -396,7 +435,7 @@ def _get_table():
 见 §4.4。
 
 ### 6.3 降级与容错
-- 任一 KV 失败 → miss → fast_fail 422
+- 任一 KV 失败 → miss → fast_fail 412
 - Merkle 链中间节点过期 → 该 pfx 无法还原 → miss
 - cjson 解析失败 → miss
 
