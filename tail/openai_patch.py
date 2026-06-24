@@ -172,6 +172,26 @@ def _norm_base(url) -> str:
     return str(url or "").rstrip("/")
 
 
+def _is_miss_exception(exc) -> bool:
+    """判断异常是否是缓存 miss(网关返回 412/412 + X-Cache-Hit: false)。
+
+    openai SDK 对非 2xx 抛 APIStatusError,响应头附在 exc.response.headers。
+    """
+    resp = getattr(exc, "response", None)
+    if resp is None:
+        return False
+    # 检查 X-Cache-Hit: false 或错误码 cache_miss
+    headers = getattr(resp, "headers", {}) or {}
+    hit = headers.get(HEADER_RESP_CACHE_HIT, headers.get("x-cache-hit", ""))
+    if isinstance(hit, str) and hit.lower() == "false":
+        return True
+    # 兜底:检查 status_code 是 412/422 且 body 含 cache_miss
+    status = getattr(resp, "status_code", 0)
+    if status in (412, 422):
+        return True
+    return False
+
+
 def _is_chat_request(options) -> bool:
     url = getattr(options, "url", "") or ""
     return CHAT_PATH_MARK in str(url)
@@ -287,10 +307,25 @@ def _patch_sync():
         _set_flag(True)
         try:
             sent_increment = _apply_increment(options, state, messages)
-            resp = _orig_request(self, cast_to, options, stream=stream, stream_cls=stream_cls)
+            try:
+                resp = _orig_request(self, cast_to, options, stream=stream, stream_cls=stream_cls)
+            except Exception as exc:
+                # 缓存 miss 会以 412/412 异常抛出(openai SDK 对非 2xx 抛 APIStatusError)。
+                # 检查是否是 miss:看异常附带的响应头 X-Cache-Hit: false。
+                # 是 miss 且本次发了增量 → 失效本地缓存,全量重试一次。
+                if sent_increment and _is_miss_exception(exc):
+                    _cache_mgr.invalidate(key)
+                    options.json_data = json_data
+                    _strip_cache_headers(options)
+                    resp = _orig_request(self, cast_to, options, stream=stream, stream_cls=stream_cls)
+                    captured = _captured()
+                    sent_increment = False
+                    _update_state(key, state, captured, messages, sent_increment)
+                    return resp
+                raise  # 非 miss 异常,原样抛出
             captured = _captured()
 
-            # miss → 全量重试
+            # miss 但走了 2xx 分支(如网关用 200 + X-Cache-Hit: false 而非 412)
             if captured and {str(k).lower(): v for k,v in captured.items()}.get(HEADER_RESP_CACHE_HIT.lower(), "").lower() == "false" \
                     and sent_increment:
                 _cache_mgr.invalidate(key)
@@ -333,7 +368,19 @@ def _patch_async():
         _set_flag(True)
         try:
             sent_increment = _apply_increment(options, state, messages)
-            resp = await _orig_request(self, cast_to, options, stream=stream, stream_cls=stream_cls)
+            try:
+                resp = await _orig_request(self, cast_to, options, stream=stream, stream_cls=stream_cls)
+            except Exception as exc:
+                if sent_increment and _is_miss_exception(exc):
+                    _cache_mgr.invalidate(key)
+                    options.json_data = json_data
+                    _strip_cache_headers(options)
+                    resp = await _orig_request(self, cast_to, options, stream=stream, stream_cls=stream_cls)
+                    captured = _captured()
+                    sent_increment = False
+                    _update_state(key, state, captured, messages, sent_increment)
+                    return resp
+                raise
             captured = _captured()
 
             if captured and {str(k).lower(): v for k,v in captured.items()}.get(HEADER_RESP_CACHE_HIT.lower(), "").lower() == "false" \

@@ -229,10 +229,10 @@ def build_app(cfg: protocol.GatewayConfig, storage: Storage,
 
 
 def _fast_fail(cfg: protocol.GatewayConfig) -> JSONResponse:
-    """缓存未命中(fast_fail 模式)响应:422 + X-Cache-Hit: false。"""
+    """缓存未命中(fast_fail 模式)响应:412 + X-Cache-Hit: false。"""
     expire = protocol.compute_expire(cfg.ttl, cfg.jitter)
     return JSONResponse(
-        status_code=422,
+        status_code=412,
         headers={
             HEADER_RESP_CACHE_HASH: "",
             HEADER_RESP_CACHE_EXPIRE: str(expire),

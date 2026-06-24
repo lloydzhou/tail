@@ -53,14 +53,14 @@ local function read_request_body()
     return cjson.decode(raw)
 end
 
--- fast_fail 响应:不转发后端,直接 422。
+-- fast_fail 响应:不转发后端,直接 412。
 local function respond_fast_fail(cfg)
     local expire = protocol.compute_expire(cfg.ttl, cfg.jitter)
     ngx.header[protocol.HEADER_RESP_CACHE_HASH] = ""
     ngx.header[protocol.HEADER_RESP_CACHE_EXPIRE] = tostring(expire)
     ngx.header[protocol.HEADER_RESP_CACHE_HIT] = "false"
     ngx.header["Content-Type"] = "application/json"
-    ngx.status = 422
+    ngx.status = 412
     ngx.say(cjson.encode({
         error = {
             message = "prefix cache miss; retry with full messages",
@@ -68,7 +68,7 @@ local function respond_fast_fail(cfg)
             code = "cache_miss",
         },
     }))
-    ngx.exit(422)
+    ngx.exit(412)
 end
 
 -- access 阶段:同步读 Kvrocks,还原三段 + 请求体改写。

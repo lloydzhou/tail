@@ -443,3 +443,36 @@ def test_cache_state_uses_digest_not_array(gateway):
     assert state.prefix_count == 1
     assert len(state.prefix_digest) == 16  # 16 hex
     client.close()
+
+
+# ===========================================================================
+# v2.2: 412/422 miss 异常的重试(SDK 一致性核心 bug 修复)
+# ===========================================================================
+
+
+def test_miss_412_triggers_full_retry(gateway):
+    """网关返回 412(缓存 miss)→ SDK 捕获异常 → 全量重试 → 成功。
+
+    回归真实场景 bug:网关重启/dbm 丢失后,SDK 本地缓存的 hash 在网关找不到,
+    网关返回 412 异常,SDK 必须 catch 并全量重试,不能把异常抛给用户。
+    """
+    gateway.reset()
+    client = _client(gateway)
+    # 正常一轮建缓存
+    client.chat.completions.create(model=MODEL,
+        messages=[{"role": "user", "content": "first"}])
+    # 第二轮:模拟网关找不到该 hash → 返回 412
+    # (mock gateway 的协商逻辑会因 hash 不匹配返回 412)
+    state = kvcache_openai.get_cache_state(MODEL, gateway.url)
+    # 故意改坏 hash,让网关 miss
+    state.cache_hash = "0::0::bad_hash_not_in_gateway"
+    state.prefix_count = 1
+    state.prefix_digest = kvcache_openai._messages_digest([{"role": "user", "content": "first"}])
+
+    msgs = [{"role": "user", "content": "first"}, {"role": "user", "content": "second"}]
+    # 不应抛异常,应自动全量重试成功
+    r = client.chat.completions.create(model=MODEL, messages=msgs)
+    assert r.choices[0].message.content == "ok"
+    # 应有两次请求(第一次 miss 412,第二次全量重试成功)
+    assert len(gateway.received) >= 2
+    client.close()

@@ -269,7 +269,7 @@ async def test_e2e_miss_fast_fail(gateway_stack):
                          json={"model": "deepseek-chat", "messages": [u("inc")]},
                          headers={"X-Cache-Hash": "nope::0::0",
                                   "X-Cache-Prefix-Length": "1"})
-        assert r.status_code == 422
+        assert r.status_code == 412
         assert r.headers["X-Cache-Hit"] == "false"
 
 

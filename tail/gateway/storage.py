@@ -238,6 +238,11 @@ class DbmStorage(Storage):
             "len": len(messages), "expire_at": expire_at,
         }
         self._set_with_ttl(self._k("meta", cache_key), meta, cfg.ttl)
+        # 强制刷盘:防止进程被杀(Ctrl+C / OOM)时最后一次写入停留在 dbm 内部缓冲区
+        try:
+            self._db.sync()
+        except Exception:
+            pass  # 部分 dbm 后端不支持 sync,忽略
         return cache_key
 
     def ping(self) -> bool:
