@@ -207,6 +207,8 @@ reconstruct(pfx_hash):
 
 ## 4. 协议(对外 HTTP)
 
+> 完整线缆规范(请求/响应头、`412` 契约、`cache_key` 三段格式、SSE 透传)已独立成 [`docs/PROTOCOL.md`](./PROTOCOL.md)。本章给出网关侧的实现要点与命中判定流程。
+
 ### 4.1 不变
 - 路径、body、`X-Cache-Hash` / `X-Cache-Prefix-Length` 语义全不变
 - `X-Cache-Hash` 现在是组合 key(三段拼接),客户端不感知内部结构

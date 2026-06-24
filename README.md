@@ -142,7 +142,8 @@ openresty/                 # (可选)OpenResty/Lua 版网关,与 Python 版 cach
 
 tests/                     # 测试(Python 网关 + patch 单测 + OpenResty 端到端)
 docs/
-└── DESIGN-chunked-cache.md   # 设计文档(v2.1 Segment-Merkle + 访问驱动续期)
+├── DESIGN-chunked-cache.md   # 设计文档(v2.1 Segment-Merkle + 访问驱动续期)
+└── PROTOCOL.md               # ★ 线缆协议规范(X-Cache-* 头 / 412 / cache_key 三段格式)
 run.sh                     # 一键启停(Kvrocks + 网关 + 模拟后端,OpenResty 版用)
 ```
 
@@ -166,6 +167,9 @@ run.sh                     # 一键启停(Kvrocks + 网关 + 模拟后端,OpenRe
 | `X-Cache-Hash` | 本次前缀的新哈希,客户端应保存。 |
 | `X-Cache-Expire` | 缓存过期 Unix 时间戳(带 ±jitter 防雪崩)。 |
 | `X-Cache-Hit` | `true`/`false`,网关是否命中。 |
+
+> 完整线缆协议规范(`X-Cache-*` 头语义、`412` 快速失败契约、`cache_key` 三段哈希格式、
+> Segment-Merkle 链、SSE 透传契约)见 **[`docs/PROTOCOL.md`](docs/PROTOCOL.md)**。
 
 ---
 

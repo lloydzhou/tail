@@ -150,7 +150,8 @@ openresty/                 # (optional) OpenResty/Lua gateway; cache_key byte-id
 
 tests/                     # tests (Python gateway + patch unit + OpenResty e2e)
 docs/
-└── DESIGN-chunked-cache.md   # design doc (v2.1 Segment-Merkle + access-driven renewal)
+├── DESIGN-chunked-cache.md   # design doc (v2.1 Segment-Merkle + access-driven renewal)
+└── PROTOCOL.md               # ★ wire protocol spec (X-Cache-* headers / 412 / cache_key triple)
 run.sh                     # one-shot start/stop (used by the OpenResty build)
 ```
 
@@ -174,6 +175,10 @@ When the hash is present, `messages` may contain **only the delta**; the gateway
 | `X-Cache-Hash` | The new hash for this prefix; the client should store it. |
 | `X-Cache-Expire` | Cache expiry as a Unix timestamp (with ±jitter, anti-avalanche). |
 | `X-Cache-Hit` | `true`/`false` — whether the gateway cache hit. |
+
+> Full wire-protocol spec (semantics of the `X-Cache-*` headers, the `412` fast-fail contract,
+> the `cache_key` triple-hash format, the Segment-Merkle chain, and the SSE passthrough contract)
+> lives in **[`docs/PROTOCOL.md`](docs/PROTOCOL.md)**.
 
 ---
 
