@@ -57,8 +57,9 @@ Steady state with TTL (1000 concurrent conversations, 30% active):
 | daily uplink traffic saved | ~60 GB |
 | **ratio** | **1 GB storage ≈ 53 GB/day traffic** |
 
-Storage expires and reclaims; traffic is gone forever. That's **~1 GB of short-lived
-disk** (cost ~¥0.03/day) buying **~60 GB/day of uplink traffic** (cost ~¥30/day) — a **~1000× ROI**.
+Storage expires and reclaims; traffic is gone forever. Using [AliCloud public pricing](https://help.aliyun.com/zh/ecs/block-storage-devices):
+**~1 GB ESSD disk** (¥0.50/GB/month ≈ ¥0.02/day) buys **~60 GB/day of uplink traffic**
+(pay-as-you-go ¥0.80/GB ≈ ¥48/day) — a **~2500× ROI**.
 
 ---
 
