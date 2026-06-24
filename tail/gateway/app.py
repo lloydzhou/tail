@@ -158,9 +158,13 @@ def build_app(cfg: protocol.GatewayConfig, storage: Storage,
         try:
             # stream=True:不缓冲整个响应,SSE 字节流逐块透传
             client = httpx.AsyncClient(**client_kwargs)
+            # 自己序列化 body(ensure_ascii=False,保留 UTF-8 中文,避免 \uXXXX 膨胀)
+            # 比 httpx 的 json= 更省字节(中文 3 字节 vs 6 字节 \uXXXX)
+            body_bytes = json.dumps(body, ensure_ascii=False).encode("utf-8") if body else b"{}"
+            fwd_headers["content-type"] = "application/json"
             req = client.build_request(
                 "POST", f"{cfg.backend_url}/v1/chat/completions",
-                json=body if body else {}, headers=fwd_headers)
+                content=body_bytes, headers=fwd_headers)
             upstream = await client.send(req, stream=True)
         except Exception as e:
             logger.exception("upstream forward failed")
