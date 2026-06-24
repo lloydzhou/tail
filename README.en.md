@@ -27,6 +27,50 @@ on-prem → cloud LLM gateway, cross-border calls, mobile clients.
 
 ---
 
+## Storage vs bandwidth: the ROI
+
+Tail's essence is **trading temporary storage for permanent bandwidth**. Cache has a
+TTL (30 min – 6 h, auto-expired and reclaimed), while bandwidth is **consumed once and
+gone** — making this an extremely favorable trade.
+
+Example: **1M-token context** (DeepSeek V4 / GLM-5.2), computed with the v2.1 data structure:
+
+**Per-conversation storage cost** (500 turns):
+
+| key type | count | per-item | subtotal |
+|----------|-------|----------|----------|
+| meta | 1 | 150 B | 150 B |
+| sys (if any) | 1 | ~8 KB | 8 KB |
+| tools (if any) | 1 | ~4 KB | 4 KB |
+| seg (per turn) | 500 | ~8 KB | ~3.8 MB |
+| pfx (Merkle nodes) | 500 | 80 B | ~40 KB |
+| **total** | | | **~3.9 MB** |
+
+**Bandwidth saved** (same conversation, 10 turns):
+
+| | Without Tail | With Tail |
+|---|---|---|
+| total uplink | 3.8 MB × 10 = **38 MB** | first 3.8 MB + 9 × ~2 KB ≈ **3.8 MB** |
+| saved | — | **34 MB (90%)** |
+
+> **1 MB of temporary storage ≈ 9 MB of uplink bandwidth saved.**
+
+**Steady state with TTL** (1000 concurrent conversations, 30% active):
+
+| metric | value |
+|--------|-------|
+| steady-state storage (active convs only) | ~1.1 GB |
+| daily uplink saved | ~60 GB |
+| **ratio** | **1 GB storage ≈ 53 GB/day bandwidth** |
+
+Storage expires and reclaims; bandwidth is gone forever. That's **~1 GB of short-lived
+disk** (cost ~¥0.03/day) buying **~60 GB/day of uplink** (cost ~¥30/day) — a **~1000× ROI**.
+
+> The longer the context and the more turns, the higher the ROI (in the limit a delta is
+> ~0.05% — a 99.9% saving).
+
+---
+
 ## How it works
 
 ```mermaid
