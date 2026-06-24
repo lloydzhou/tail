@@ -1,41 +1,39 @@
-# Tail — Uplink Bandwidth Optimizer for LLM Gateways
+# Tail — Uplink Traffic Optimizer for LLM Gateways
 
 > **Tail** — *Send the tail, the head is cached.*
 >
 > The name comes from `tail -f`: show only the newly appended lines. Tail applies
 > the same mental model to LLM requests — the prefix (the head) is already cached at
 > the gateway, so the client sends only the incremental turn (the tail),
-> **transparently saving uplink bandwidth between the SDK and the LLM Gateway**.
+> **transparently saving uplink traffic between the SDK and the LLM Gateway**.
 
-## How much does it save?
+## How much does it save? At what cost?
 
 Long-context models (e.g. **DeepSeek V4**, **GLM-5.2** — now defaulting to **1M tokens**)
 make multi-turn request bodies **95%+ repeated prefix**. Tail sends only the delta.
+
+### Uplink traffic saved
 
 Using a **1M-token context** as an example (DeepSeek V4 / GLM-5.2 default to 1M; ~4 bytes/token, mostly English):
 
 | | Without Tail | With Tail |
 |---|---|---|
 | Single request body | ~4 MB (full messages) | ~2 KB (delta + hash) |
-| 10-turn conversation uplink | ~40 MB | ~4 MB (first) + 9×2 KB ≈ **4 MB** |
+| 10-turn conversation uplink | ~40 MB | first ~4 MB + 9 × ~2 KB ≈ **4 MB** |
 | Saving | — | **~90%** |
 | 1000 concurrent convs × 10 turns/day | ~40 GB/day uplink | ~4 GB/day uplink |
 
 The longer the context and the more turns, the higher the ratio (in the limit a single
-delta is ~0.05% — a **99.9%** saving). Especially valuable where **uplink is metered**:
+delta is ~0.05% — a **99.9%** saving). Especially valuable where **uplink traffic is metered**:
 on-prem → cloud LLM gateway, cross-border calls, mobile clients.
 
----
+### The cost: how much temporary storage
 
-## Storage vs bandwidth: the ROI
-
-Tail's essence is **trading temporary storage for permanent bandwidth**. Cache has a
-TTL (30 min – 6 h, auto-expired and reclaimed), while bandwidth is **consumed once and
+Tail's essence is **trading temporary storage for uplink traffic**. Cache has a
+TTL (30 min – 6 h, auto-expired and reclaimed), while traffic is **consumed once and
 gone** — making this an extremely favorable trade.
 
-Example: **1M-token context** (DeepSeek V4 / GLM-5.2), computed with the v2.1 data structure:
-
-**Per-conversation storage cost** (500 turns):
+Per-conversation storage cost (1M-token context, 500 turns), using the v2.1 data structure:
 
 | key type | count | per-item | subtotal |
 |----------|-------|----------|----------|
@@ -46,28 +44,21 @@ Example: **1M-token context** (DeepSeek V4 / GLM-5.2), computed with the v2.1 da
 | pfx (Merkle nodes) | 500 | 80 B | ~40 KB |
 | **total** | | | **~3.9 MB** |
 
-**Bandwidth saved** (same conversation, 10 turns):
+### ROI: storage for traffic
 
-| | Without Tail | With Tail |
-|---|---|---|
-| total uplink | 3.8 MB × 10 = **38 MB** | first 3.8 MB + 9 × ~2 KB ≈ **3.8 MB** |
-| saved | — | **34 MB (90%)** |
+Same conversation, 10 turns: **3.9 MB of storage** buys **34 MB of uplink traffic saved** —
+**1 MB of temporary storage ≈ 9 MB of traffic.**
 
-> **1 MB of temporary storage ≈ 9 MB of uplink bandwidth saved.**
-
-**Steady state with TTL** (1000 concurrent conversations, 30% active):
+Steady state with TTL (1000 concurrent conversations, 30% active):
 
 | metric | value |
 |--------|-------|
 | steady-state storage (active convs only) | ~1.1 GB |
-| daily uplink saved | ~60 GB |
-| **ratio** | **1 GB storage ≈ 53 GB/day bandwidth** |
+| daily uplink traffic saved | ~60 GB |
+| **ratio** | **1 GB storage ≈ 53 GB/day traffic** |
 
-Storage expires and reclaims; bandwidth is gone forever. That's **~1 GB of short-lived
-disk** (cost ~¥0.03/day) buying **~60 GB/day of uplink** (cost ~¥30/day) — a **~1000× ROI**.
-
-> The longer the context and the more turns, the higher the ROI (in the limit a delta is
-> ~0.05% — a 99.9% saving).
+Storage expires and reclaims; traffic is gone forever. That's **~1 GB of short-lived
+disk** (cost ~¥0.03/day) buying **~60 GB/day of uplink traffic** (cost ~¥30/day) — a **~1000× ROI**.
 
 ---
 
@@ -206,7 +197,7 @@ OpenAI's [Responses API](https://developers.openai.com/api/docs/guides/conversat
 - **OpenAI-only and OK with 30-day server-side storage** → Responses API is enough, no Tail needed
 - **Using DeepSeek / Qwen / local vLLM / multiple vendors** → Tail (Responses API doesn't support non-OpenAI)
 - **Compliance requires self-controlled data (finance/healthcare/gov)** → Tail (cache in your own gateway, never touches a third party)
-- **Want to save *uplink bandwidth* rather than *token billing*** → Tail works directly; Responses API saves bandwidth too but relies on server-side impl
+- **Want to save *uplink traffic* rather than *token billing*** → Tail works directly; Responses API saves traffic too but relies on server-side impl
 - **The two stack**: use Tail to save uplink, and still use Responses API when the backend is OpenAI
 
 ### The essential difference
