@@ -342,6 +342,65 @@ if resp.headers.get("x-tail-retransmit"):
     client.invalidate()                        # 前缀失效，下一轮重发全文
 ```
 
+### 接 magpie：两个 magpie、各一个开关
+
+magpie（Go，本地一个 + 集群一个）里这套传输是原生实现的，不需要旁路进程：
+`internal/tail` 是协议的 Go 实现（渲染/切块/链/存储，与 Python 版本逐字节对拍），
+gateway 的两端各挂一个开关。
+
+**集群侧的 magpie（出站侧的老大：它接受尾巴字节）**
+
+```bash
+MAGPIE_TAIL=1 magpie serve         # gateway 开关：接受 application/x-tail-v3
+# 或者写进 ~/.config/magpie/settings.json：{"tail": true}
+```
+
+**本地侧的 magpie（把 provider 指过去，加一个 `tail=on`）**
+
+```bash
+magpie provider add peer url=http://10.0.0.5:3425/v1 key=sk-… models=… tail=on
+```
+
+provider 的 `url=` 还是普通的 chat completions 地址（`…/v1`），`tail=on` 只改变
+「同一个地址怎么发」——所以 A/B 对比就是换一个 provider 名，请求体一模一样。
+
+实测（两个真实 magpie 二进制，中间用计字节的 TCP 中继观测**两个 magpie 之间的
+真实线上字节**，mock 推理服务在集群侧，同一个 agent 会话逐轮变长）：
+
+| 轮 | plain 上行 | tail 上行 | 省 |
+| ---: | ---: | ---: | ---: |
+| 1 | 42.0 KB | 41.9 KB | 1.0x |
+| 2 | 52.0 KB | 10.4 KB | 5.0x |
+| 4 | 72.0 KB | 10.3 KB | 7.0x |
+| 6 | 92.1 KB | 10.7 KB | 8.6x |
+| 8 | 112.1 KB | 10.6 KB | 10.6x |
+| 10 | 132.0 KB | 10.3 KB | 12.8x |
+| 合计 | **0.85 MB** | **0.13 MB** | **6.4x** |
+
+第 1 轮是全量（冷启动），之后每轮只上行「新增的那一轮」；两条路到达推理服务的
+messages 逐轮一致（保真校验）。复跑：
+
+```bash
+# magpie 侧：go build -tags nogui -o /tmp/magpie-tail .
+python -m tools.magpie_native --magpie /tmp/magpie-tail --rounds 10
+```
+
+### 不改 magpie 的部署方式（旁路代理）
+
+同一个协议也有纯 Python 的实现，适合先灰度、或客户端不是 magpie 的场景：
+
+```bash
+# 集群侧：网关放在 magpie 前面（它还原出标准 JSON 再转给 magpie）
+python -m tail.serve --backend http://127.0.0.1:3425 --port 8765 \
+    --redis redis://127.0.0.1:6379/0
+# 本地侧：magpie 的 provider base_url 指向这个代理
+python -m tail.proxy --upstream http://10.0.0.5:8765 --port 8766
+```
+
+`tail/proxy.py` 就是同协议的客户端侧参考实现（`--native` 可切换成纯转发做基线）。
+对着两个真实 magpie 跑这套旁路：`python -m tools.magpie_live --magpie <二进制>`；
+只跑协议本身（不用 magpie）：`python -m tools.magpie_pair`。
+
 ## 线上格式
 
 `Content-Type: application/x-tail-v3`。**body 就是渲染文本的一段原始字节**——
