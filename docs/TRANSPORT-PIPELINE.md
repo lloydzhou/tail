@@ -557,8 +557,12 @@ v2 时这里更尖锐(每个 17 B 引用帧都会变成一个 chunk),v3 已经�
 这是与 v2「扁平集合」的本质区别:
 
 ```
-blk:{block_hash_hex} → parent_hex(32 B, ASCII) ‖ content(≤ 512 B)
+p:{block_hash_hex} → parent_hex(16 B, ASCII=32)
+b:{block_hash_hex} → content(≤ 块大小)
 ```
+
+**链和正文分开放**(v4):走链只需要父哈希,所以每跳只搬 16 字节;正文由一条 MGET
+批量取回。早先把两者拼在同一个 value 里,走一条 829 KB 前缀就等于在 Lua 里白搬 887 KB。
 
 因为 `block_hash = blake2b(parent_hash ‖ content)`,所以给定链尾摘要 `H`,
 就等价于拿到了**整条前缀的入口**:
@@ -567,9 +571,8 @@ blk:{block_hash_hex} → parent_hex(32 B, ASCII) ‖ content(≤ 512 B)
 H → block[1773] → parent → block[1772] → ... → block[0] → 0…0(链根)
 ```
 
-父哈希在 value 里是**定长 32 字节 hex**,链根写成 16 个 `\x00`。定长不是洁癖:
-早期版本把链根的父写成空串,读回来 `v[32:]` 会把根块正文的**前 32 字节**切掉,
-800 KB 会话的第一块永远是坏的(见 §9「修过的三个真 bug」)。
+父哈希在 `p:` 的 value 里是**定长 hex**(链根写成 16 个 `\x00`),走链脚本可以直接把
+读到的 value 当下一跳,不需要额外编解码。
 
 于是 v2 §10 里那句「顺序信息与帧序列重复、所以不需要链」自动失效:
 v3 没有帧序列了,顺序信息**无处可去**,链是它的唯一载体。
@@ -578,7 +581,7 @@ v3 没有帧序列了,顺序信息**无处可去**,链是它的唯一载体。
 
 | 实现 | 说明 |
 |---|---|
-| `RedisChainStore` | **生产唯一后端**:两个 Lua 脚本读写链式 value |
+| `RedisChainStore` | **生产唯一后端**:`p:`/`b:` 两个命名空间 + 两个 Lua 脚本 |
 | `MemoryChainStore` | 进程内字典,**仅测试替身**(不落盘、不跨进程) |
 
 `make_store("redis://host:6379/0", ttl=…)` → `RedisChainStore`;`make_store("")` 只在测试里用。
@@ -586,13 +589,20 @@ v3 没有帧序列了,顺序信息**无处可去**,链是它的唯一载体。
 ### 7.3 写:一个脚本写完整串块
 
 ```lua
--- KEYS = 整串块的 key;ARGV[1] = TTL 秒;ARGV[2..] = value(parent‖content)
+-- KEYS = [b:key_1..b:key_n, p:key_1..p:key_n];ARGV[1] = TTL 秒
+-- ARGV[2..n+1] = 正文;ARGV[n+2..2n+1] = 父哈希 hex
+local n = #KEYS / 2
 local ttl = tonumber(ARGV[1])
-for i = 1, #KEYS do
-  if ttl > 0 then redis.call('SET', KEYS[i], ARGV[i + 1], 'EX', ttl)
-  else redis.call('SET', KEYS[i], ARGV[i + 1]) end
+for i = 1, n do
+  if ttl > 0 then
+    redis.call('SET', KEYS[i], ARGV[i + 1], 'EX', ttl)          -- 正文
+    redis.call('SET', KEYS[n + i], ARGV[n + 1 + i], 'EX', ttl)  -- 父链
+  else
+    redis.call('SET', KEYS[i], ARGV[i + 1])
+    redis.call('SET', KEYS[n + i], ARGV[n + 1 + i])
+  end
 end
-return #KEYS
+return n
 ```
 
 **不能用 pipeline**:非事务管线只保证「按顺序发出去」,中途出错或进程被杀会留下半条链,
@@ -604,23 +614,26 @@ return #KEYS
 ### 7.4 读:一个脚本走链 + 续期
 
 ```lua
--- KEYS[1] = "blk:" 前缀;ARGV[1] = tip hex;ARGV[2] = 块数;ARGV[3] = TTL 秒
-local prefix, cur, n, ttl = KEYS[1], ARGV[1], tonumber(ARGV[2]), tonumber(ARGV[3])
+-- KEYS[1] = "p:" 前缀,KEYS[2] = "b:" 前缀
+-- ARGV[1] = tip hex;ARGV[2] = 块数;ARGV[3] = TTL 秒
+local pk, bk, cur = KEYS[1], KEYS[2], ARGV[1]
+local n, ttl = tonumber(ARGV[2]), tonumber(ARGV[3])
 local ids = {}
 for i = 1, n do
-  local k = prefix .. cur
-  local v = redis.call('GET', k)
-  if not v then return {} end              -- 前缀不完整 → 当作 miss,让客户端重发
-  if ttl > 0 then redis.call('EXPIRE', k, ttl) end
+  local v = redis.call('GETEX', pk .. cur, 'EX', ttl)  -- 读父哈希 + 续链 TTL(一条命令)
+  if not v then return {} end                          -- 前缀不完整 → miss,让客户端重发
+  redis.call('EXPIRE', bk .. cur, ttl)                 -- 正文 TTL 在同一脚本里一起续
   ids[#ids + 1] = cur
-  cur = string.sub(v, 1, 32)               -- 父哈希
+  cur = v                                              -- 下一跳
 end
 return ids
 ```
 
-一次调用同时解决两件事,这是 per-block TTL 下**唯一**能避免「头先过期」的做法:
-若只在写入时设 TTL,长会话的头部块先死,而任何前缀都必须从头部开始 ⇒ 整条作废,
-哪怕它 99% 的块还在。读的时候顺带把整条链续到 TTL,会话活着它就活着。
+一次调用同时解决三件事:走链、续链 TTL、续正文 TTL。热心跳也在脚本里做——
+每跳依赖上一跳的结果,由网关逐跳发命令就是 N 次网络往返。
+
+两把 key 的 TTL 必须一起续,否则会出现「链还在、正文先死」:那样 `resolve` 成功但
+`get_many` 缺块,上层仍然要判 miss 让客户端重发——正确但更慢。
 
 脚本**不做拼接**:返回块哈希列表,内容由网关侧用 MGET 批量取、流式拼接。
 在 Lua 里拼 800 KB 字符串会阻塞整个 Redis 实例。
@@ -639,35 +652,22 @@ return ids
 
 ### 7.5 实测成本:走链是 O(块数)
 
-`tools/bench.py` 的「存储层次」「Redis」两段,夹具是 829 KB 前缀 = **1,774 块**:
+`tools/bench.py` 的「Redis」一段,夹具是 829 KB 前缀。走链是 O(块数),所以
+**块大小决定单实例上限**:
 
-| 操作 | 往返 | 单次耗时 |
-|---|---|---|
-| 写整条链(单脚本,1,774 块) | 1 | 6.6~9.7 ms |
-| 走链 1,774 跳(单脚本,顺带续期) | 1 | 4.5~5.5 ms |
-| MGET 1,774 块 | 1 | 2.5~3.6 ms |
-| **读整条前缀(走链 + MGET)** | **2** | **7.3~11.3 ms** |
-| `MemoryChainStore`(进程内,测试替身) | 0 | 0.14~0.47 ms |
+| 块大小 | 块数 | 写整串(2 key/块) | 走链 | MGET | **读一次** | 单实例上限 |
+|---|---|---|---|---|---|---|
+| 512 B | 1,774 | 9.4 ms | 3.8~4.4 ms | 2.6~3.2 ms | **7.3~9 ms** | **110~140 req/s** |
+| 2 KB | 443 | 6.9 ms | 1.5~2.0 ms | 1.9~2.2 ms | **3.9~5.3 ms** | **190~260 req/s** |
+| 4 KB | 221 | 5.1 ms | 1.1~1.4 ms | 1.1~1.4 ms | **2.6~2.9 ms** | **350~390 req/s** |
+| 8 KB | 110 | — | 0.9~1.0 ms | 0.9~1.1 ms | **1.7~1.9 ms** | **520~590 req/s** |
 
-Redis 的吞吐要按**块**算,实测约 **15~21 万块/秒/实例**(每条请求的块数 = 上下文 / 512),
-所以「全量前缀」的只读上限随上下文线性变差:
+块放大的代价只有一个:热请求每轮重发不满一块的尾巴(512 B 时平均 256 B,4 KB 时
+平均 2 KB,占 829 KB 的 0.25%)。所以块大小由「上下文长度 × 尾块占比」定,不是常量。
 
-| 上下文 | 66 KB | 242 KB | 418 KB | 829 KB |
-| --- | --- | --- | --- | --- |
-| 块数 | 133 | 485 | 836 | 1,774 |
-| 单实例读一次 | 0.8 ms | 2.3 ms | 4.8 ms | 8.0 ms |
-| 单实例上限 | ~1,300 req/s | ~435 req/s | ~210 req/s | **120~140 req/s** |
-
-块大小是这条曲线唯一的旋钮(生产路径实测,829 KB 前缀):
-
-| 块大小 | 块数 | 读一次 | 单实例上限 |
-| --- | --- | --- | --- |
-| 512 B | 1,774 | 8.01 ms | 125 req/s |
-| 4 KB | 221 | 2.73 ms | **366 req/s** |
-
-块放大的代价只有一个:热请求每轮重发不满一块的尾巴,512 B 时平均 256 B,
-4 KB 时平均 2 KB(占 829 KB 的 0.25%)。所以块大小由「上下文长度 × 尾块占比」定,
-不是常量。
+单个 key 的操作成本(1,774 次,脚本内):`GET` 1.7 ms、`GETEX` 2.2 ms、
+`GET+EXPIRE` 3.0 ms、`GETEX+EXPIRE` 3.6 ms —— 续期本身就是每块一次额外调用,
+这是「分开存 + 两把 key 都续期」在 512 B 块下不划算的原因,也是块该放大的依据。
 
 规划公式(按会话键分片,线性):
 
