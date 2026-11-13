@@ -95,7 +95,7 @@ def bench_speed(payload: dict) -> None:
 
     print("### 速度")
     print()
-    print(f"渲染文本 {len(text):,} B,{n_blocks} 个满块;取 5 次 **CPU 时间**最小值。")
+    print(f"渲染文本 {len(text):,} B,{n_blocks} 个满块;取 7 次 wall clock 最小值。")
     print()
     print("| 环节 | 吞吐 | 单次耗时 | 备注 |")
     print("|---|---|---|---|")
@@ -197,7 +197,7 @@ def bench_real_sizes() -> None:
             seed += 2
         return {"model": "deepseek-chat", "messages": messages}
 
-    print("### 真实体积下的 CPU 成本(客户端 + 网关)")
+    print("### 真实体积下的两端耗时(客户端 + 网关,wall clock)")
     print()
     print("| 请求体 | 客户端编码 | 网关解码并重建 JSON | 合计 |")
     print("|---|---|---|---|")

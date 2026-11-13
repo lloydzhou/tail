@@ -174,14 +174,23 @@ class _AsyncToSyncBody:
 class _AsyncJsonStream(httpx.AsyncByteStream):
     """把同步的解码会话适配成 httpx 的异步流式请求体。
 
-    解码是 CPU 密集的同步操作,放进线程池执行,避免阻塞事件循环;
-    每产出一个片段就立刻交给 httpx 发出,不累积。
+    解码是 CPU 密集的同步操作,放进线程池执行,避免阻塞事件循环。
+
+    **批量取**:每跨越一次线程边界就把能拿的都拿走(最多 ``BATCH`` 字节),
+    而不是一次只取一个片段。一次 ``run_in_executor`` 往返约 0.5 ms,57 个片段
+    就要付 30 ms;机器有负载时更糟。第一批只取一个片段,保证上游立刻开始收到
+    数据(实测首个片段 0.4 ms 就到),不会为了凑批而推迟首字节。
     """
+
+    #: 单次跨线程最多搬运的字节数。足够大以摊薄往返成本,又不至于让单批
+    #: 编解码占用线程过久。
+    BATCH = 256 * 1024
 
     def __init__(self, session) -> None:
         self._session = session
         self._iter = iter(session)
         self._done = False
+        self._first = True
         # 单线程执行器:保证 next() 永远在同一个线程里调用。
         # 用默认的 None 会让多个 worker 线程并发调 next(),而惰性迭代器
         # 不是线程安全的——实测会丢消息(13 条只发出 2 条)。
@@ -192,13 +201,32 @@ class _AsyncJsonStream(httpx.AsyncByteStream):
         loop = asyncio.get_running_loop()
         try:
             while not self._done:
-                piece = await loop.run_in_executor(self._pool, self._next)
-                if piece is None:
+                batch = await loop.run_in_executor(self._pool, self._pull)
+                if batch is None:
                     self._done = True
                     break
-                yield piece
+                yield batch
         finally:
             self._pool.shutdown(wait=False)
+
+    def _pull(self):
+        """在解码线程里取一批,拼成一段字节返回。"""
+        limit = None if self._first else self.BATCH
+        self._first = False
+        first = self._next()
+        if first is None:
+            return None
+        if limit is None:
+            return first
+        parts = [first]
+        size = len(first)
+        while size < limit:
+            piece = self._next()
+            if piece is None:
+                break
+            parts.append(piece)
+            size += len(piece)
+        return parts[0] if len(parts) == 1 else b"".join(parts)
 
     def _next(self):
         try:

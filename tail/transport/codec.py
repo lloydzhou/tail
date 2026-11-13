@@ -39,6 +39,18 @@ from .frames import Frame
 # 客户端侧编码器
 # ---------------------------------------------------------------------------
 
+#: 编码输出合并到这么大再交给上层。
+#:
+#: 一个 512B 块编成引用帧只有 17B。若每帧单独 yield,一个 800 KB 上下文会产生
+#: 1500+ 个 17B 片段,每个片段在 HTTP 层都要单独成一个 chunk,网关那边还要
+#: 逐片过一遍「事件循环 ↔ 线程池」的桥接。实测 800 KB 热请求因此多付约
+#: 170 ms——远超编码本身(3.7 ms)。
+#:
+#: 合并到 16 KB 既消掉逐帧开销,又不会明显推迟首个字节(对端要收到第一个
+#: 块才开始解码,16 KB 内必然已包含多个块)。
+OUTPUT_CHUNK = 16 * 1024
+
+
 class Encoder:
     """把渲染文本编码成帧流。
 
@@ -61,14 +73,18 @@ class Encoder:
         return len(self._known)
 
     def iter_encode(self, text_pieces: Iterable[bytes]) -> Iterator[bytes]:
-        """流式编码:喂文本片段流,产出帧流片段。"""
+        """流式编码:喂文本片段流,产出帧流片段(已合并成 ~16 KB 一片)。"""
         hasher = chunking.BlockHasher(self._block_size)
-        for piece in text_pieces:
-            for bid, block in hasher.feed(piece):
+
+        def raw_frames() -> Iterator[bytes]:
+            for piece in text_pieces:
+                for bid, block in hasher.feed(piece):
+                    yield self._encode_block(bid, block)
+            for bid, block in hasher.flush():
                 yield self._encode_block(bid, block)
-        for bid, block in hasher.flush():
-            yield self._encode_block(bid, block)
-        yield frames.encode_end()
+            yield frames.encode_end()
+
+        yield from _coalesce(raw_frames())
 
     def iter_encode_events(self, events) -> Iterator[bytes]:
         """流式编码**事件流**。
@@ -80,13 +96,17 @@ class Encoder:
         from .render import EventKind, event_to_bytes
 
         hasher = chunking.BlockHasher(self._block_size)
-        for kind, payload in events:
-            for piece in event_to_bytes((kind, payload)):
-                for bid, block in hasher.feed(piece):
-                    yield self._encode_block(bid, block)
-        for bid, block in hasher.flush():
-            yield self._encode_block(bid, block)
-        yield frames.encode_end()
+
+        def raw_frames() -> Iterator[bytes]:
+            for kind, payload in events:
+                for piece in event_to_bytes((kind, payload)):
+                    for bid, block in hasher.feed(piece):
+                        yield self._encode_block(bid, block)
+            for bid, block in hasher.flush():
+                yield self._encode_block(bid, block)
+            yield frames.encode_end()
+
+        yield from _coalesce(raw_frames())
 
     def _encode_block(self, block_hash: bytes, block: bytes) -> bytes:
         """已知块发引用帧,否则发新块帧(帧里带哈希)。"""
@@ -272,3 +292,19 @@ def collect_blocks(text: bytes) -> Dict[bytes, bytes]:
     """
     from .storage import _blocks_of
     return _blocks_of(text)
+
+
+def _coalesce(chunks: Iterator[bytes], limit: int = OUTPUT_CHUNK) -> Iterator[bytes]:
+    """把细碎帧合并成 ``limit`` 左右的片段再吐出去。
+
+    只做缓冲,不改内容:拼起来与逐帧输出的字节流完全相同。最后一片即使不满
+    也会吐出,不会截断。
+    """
+    buf = bytearray()
+    for chunk in chunks:
+        buf += chunk
+        if len(buf) >= limit:
+            yield bytes(buf)
+            buf.clear()
+    if buf:
+        yield bytes(buf)
