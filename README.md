@@ -427,7 +427,19 @@ messages 逐轮一致（保真校验）。
 
 上面的数据都是单线程串行发的。真实 agent 不长这样：同时开几个会话，请求交错甚至
 并行；网关也会重启（升级、崩、被调度器挪走）。这三件事都可能让**数据失真**或
-**功能悄悄退化**，所以单独验（`tools/hardcases.py`）：
+**功能悄悄退化**。
+
+**这些不变量是 magpie 实现的性质，所以断言写在 magpie 里**（`go test` 就能跑，
+不需要 Python，也不需要起两个进程）：
+
+```bash
+cd magpie
+go test -run 'TestTailParallelSessionsDoNotMix|TestTailRecoversAfterTheFarEndStartsWithNothing' ./internal/gateway/
+go test -run 'TestOutOfOrderRepliesKeepTheLongestPrefix' ./internal/tail/
+```
+
+下面的数字是**同几件事在两个真实进程、真实线上字节下**量出来的 —— 由
+`tools/hardcases.py` 产出（Go 测试证明不变量成立，这个工具量化代价）：
 
 | 场景 | 断言 | 实测 |
 | --- | --- | --- |
