@@ -56,7 +56,7 @@ messages JSON                                 帧流
    块内容变化、`block_hash` 变化、缓存整体失效。实现上：字段顺序固定、
    `json.dumps(sort_keys=True)`。格式版本走 HTTP 头，不写进正文。
 2. **中间层无语义** —— 编码器/解码器不知道哪个字节是 role。
-3. **缓存缺失只退化，不报错** —— 取不到块时网关返回 409 + `X-Tail-Retransmit: 1`，
+3. **缓存缺失只退化，不报错** —— 取不到块时响应带 `X-Tail-Retransmit: 1`（状态码不变），
    客户端清空本地已知块集合后重发全文。存储全空、服务重启时系统仍能正常工作。
 
 ## 为什么不用原 JSON 直接传
@@ -100,10 +100,10 @@ body = client.encode_request({
 resp = httpx.post(
     "http://127.0.0.1:8765/v1/chat/completions",
     content=body,
-    headers={"content-type": "application/x-tail-blocks",
+    headers={"content-type": "application/x-tail-v2",
              "authorization": f"Bearer {api_key}"},
 )
-if resp.status_code == 409 and resp.headers.get("x-tail-retransmit"):
+if resp.headers.get("x-tail-retransmit"):
     client.invalidate()          # 缓存失效，下一轮重发全文
 ```
 
@@ -111,7 +111,7 @@ if resp.status_code == 409 and resp.headers.get("x-tail-retransmit"):
 
 ## 线上格式
 
-`Content-Type: application/x-tail-blocks`，body 为二进制帧流：
+`Content-Type: application/x-tail-v2`，body 为二进制帧流：
 
 ```
 0x01 <block_hash>                      引用：这段内容网关已有

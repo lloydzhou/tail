@@ -5,7 +5,7 @@
     python -m tail.serve --backend https://api.deepseek.com --dbm ./blocks.db
 
 客户端把 ``POST /v1/chat/completions`` 的 body 换成帧流、``Content-Type`` 设为
-``application/x-tail-blocks`` 即可。响应(SSE 或 JSON)原样透传给客户端,
+``application/x-tail-v2`` 即可。响应(SSE 或 JSON)原样透传给客户端,
 客户端不感知变化。
 
 也接受普通 ``application/json`` 请求,原样转发——便于灰度对比和排障。
