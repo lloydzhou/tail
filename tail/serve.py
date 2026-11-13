@@ -21,7 +21,7 @@ import os
 from concurrent.futures import ThreadPoolExecutor
 from typing import Any, AsyncIterator, Dict, Iterator, Optional
 
-import httpx
+import httpx2 as httpx
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, Request
