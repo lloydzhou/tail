@@ -19,6 +19,8 @@ import os
 from typing import Any, Dict, Optional
 
 import httpx
+from contextlib import asynccontextmanager
+
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse, Response, StreamingResponse
 
@@ -37,15 +39,16 @@ def build_app(backend: str,
       storage: 块存储实例;None 时用进程内内存存储
       timeout: 上游请求超时(秒)。流式响应下这是「读到第一块」的超时
     """
-    app = FastAPI(title="Tail Gateway")
+    @asynccontextmanager
+    async def lifespan(app: FastAPI):
+        yield
+        await app.state.client.aclose()
+
+    app = FastAPI(title="Tail Gateway", lifespan=lifespan)
     app.state.storage = storage if storage is not None else make_storage("")
     app.state.gateway = gw.TailGateway(app.state.storage)
     app.state.backend = backend.rstrip("/")
     app.state.client = httpx.AsyncClient(timeout=timeout)
-
-    @app.on_event("shutdown")
-    async def _close() -> None:
-        await app.state.client.aclose()
 
     @app.api_route("/v1/chat/completions", methods=["POST"])
     async def chat_completions(request: Request):
