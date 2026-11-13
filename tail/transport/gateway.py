@@ -35,7 +35,7 @@ import json
 from typing import Any, AsyncIterator, Dict, Iterable, Iterator, List, Optional, Tuple
 
 from . import chunking, codec, render
-from .codec import BlockSource, Decoder
+from .codec import BlockSource, Decoder, MissingBlock
 
 #: 帧流的 MIME
 CONTENT_TYPE_BLOCKS = "application/x-tail-v2"
@@ -174,7 +174,16 @@ class DecodeSession:
             self._decoder.finish()
             for event in self._parser.finish():
                 yield from self._handle_event(event, emit_head, first_msg)
+        except MissingBlock as exc:
+            # 缺块:**先把统计落到 session 上**再抛。否则调用方拿到的是空
+            # missing、拿不到命中率,响应里也就没法告诉客户端「该重发了」。
+            self._snapshot()
+            self.missing = list(self._decoder.missing)
+            self._error = f"missing block {exc.block_hash.hex()[:16]}"
+            raise
         except ValueError as exc:
+            # 渲染文本不合法(不含缺块)。同样先落统计。
+            self._snapshot()
             self._error = str(exc)
             raise
 
@@ -187,9 +196,13 @@ class DecodeSession:
                                 separators=(",", ":"))).encode("utf-8")
         yield b"}"
 
+        self._snapshot()
+        self.missing = list(self._decoder.missing)
+
+    def _snapshot(self) -> None:
+        """把解码器当前的统计搬到 session 上(正常结束与异常退出都走这里)。"""
         self.new_block_count = len(self._decoder.new_blocks)
         self.ref_block_count = self._decoder.ref_count
-        self.missing = list(self._decoder.missing)
 
     def _handle_event(self, event, emit_head, first_msg) -> Iterator[bytes]:
         kind, value = event

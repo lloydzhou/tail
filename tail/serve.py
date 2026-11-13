@@ -25,8 +25,9 @@ import httpx2 as httpx
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, Request
-from fastapi.responses import StreamingResponse
+from fastapi.responses import Response, StreamingResponse
 
+from .transport import codec as tail_codec
 from .transport import gateway as gw
 from .transport import render
 from .transport.storage import make_storage
@@ -111,7 +112,27 @@ async def _handle(request: Request, path: str, app: FastAPI):
     req = client.build_request("POST", backend + path,
                                content=_AsyncJsonStream(session),
                                headers=upstream_headers)
-    upstream = await client.send(req, stream=True)
+    try:
+        upstream = await client.send(req, stream=True)
+    except tail_codec.MissingBlock:
+        # 缺块:立刻**中止**这次上游请求,让客户端重发全文。
+        #
+        # 不能「跳过缺块照常转发、再靠 X-Tail-Retransmit 补救」:
+        #   - 洞落在 UTF-8 多字节字符中间 → 解码直接抛 UnicodeDecodeError,
+        #     客户端看到的是传输层异常,不是重发信号;
+        #   - 洞落在 message 边界   → 拼出的 prompt 语义已变却仍是合法 JSON,
+        #     会白跑一次完整推理,再把结果丢掉。
+        # 抛出时 httpx 会中断请求体上传,上游拿不到完整请求,不会开始推理。
+        return Response(status_code=409, headers={
+            gw.HEADER_VERSION: gw.TAIL_VERSION,
+            gw.HEADER_STATUS: gw.CACHE_DEGRADED,
+            gw.HEADER_RETRANSMIT: "1",
+            gw.HEADER_HIT: f"{session.hit_ratio:.3f}",
+        })
+    finally:
+        # 请求体可能没被消费完(缺块中止 / 上游提前响应),停掉后台泵,
+        # 否则它会一直往有界队列里 put 而队列已无人消费。
+        body.stop()
     return _respond(upstream, session.status, session)
 
 
@@ -157,6 +178,21 @@ class _AsyncToSyncBody:
         """在**事件循环线程**里调用,启动后台泵。"""
         if self._task is None:
             self._task = asyncio.create_task(self._pump())
+
+    def stop(self) -> None:
+        """停掉后台泵(请求体没被消费完时调用)。
+
+        只 cancel 不够:后台泵可能正卡在 ``run_in_executor(queue.put)`` 上
+        (队列满、消费端已经因缺块退出)。那样 cancel 停不掉已经在默认线程池里
+        排队的 put,线程会一直挂到队列有空位为止。清空队列给它让路。
+        """
+        if self._task is not None and not self._task.done():
+            self._task.cancel()
+        while True:
+            try:
+                self._queue.get_nowait()
+            except queue.Empty:
+                break
 
     def __iter__(self) -> Iterator[bytes]:
         # 注意:本方法可能在 executor 线程里被调用,不能在这里碰 asyncio。
@@ -246,9 +282,9 @@ def _respond(upstream: httpx.Response, status: Optional[str],
     resp_headers[gw.HEADER_VERSION] = gw.TAIL_VERSION
     if session is not None:
         resp_headers[gw.HEADER_HIT] = f"{session.hit_ratio:.3f}"
-        if session.missing:
-            # 有块取不到:告诉客户端下一轮重发全文
-            resp_headers[gw.HEADER_RETRANSMIT] = "1"
+        # 缺块不会走到这里:它在解码时就被抛出,由 _handle 直接回 409。
+        # 所以这里不再有 ``session.missing`` 的分支(以前那个分支永不触发,
+        # 因为 missing 是在生成器结束时才赋值的,而缺块会先抛异常)。
     return StreamingResponse(
         _relay(upstream),
         status_code=upstream.status_code,

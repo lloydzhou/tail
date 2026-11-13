@@ -428,22 +428,20 @@ class TestCodec:
         dec.finish()
         assert out == text and dec.ok
 
-    def test_missing_blocks_degrade_not_error(self):
+    def test_missing_block_raises_and_records(self):
+        """缺块必须立刻抛,不能跳过继续解。
+
+        跳过会产出带洞的文本:洞落在 UTF-8 多字节字符中间时后续片段首字节非法
+        (UnicodeDecodeError);洞落在 message 边界时拼出的 prompt 语义已变却仍是
+        合法 JSON,会被静默转发给上游白跑一次推理。
+        """
         text = make_text().encode()
         enc = codec.Encoder()
         enc.encode(text)
         dec = codec.Decoder(codec.NullBlockSource())
-        out = b"".join(dec.feed(enc.encode(text)))
-        dec.finish()
-        assert out == b"" and dec.missing and not dec.ok
-
-    def test_strict_mode_raises(self):
-        text = make_text().encode()
-        enc = codec.Encoder()
-        enc.encode(text)
-        dec = codec.Decoder(codec.NullBlockSource(), strict=True)
         with pytest.raises(codec.MissingBlock):
             list(dec.feed(enc.encode(text)))
+        assert dec.missing and not dec.ok
 
     def test_encoder_forget_triggers_resend(self):
         text = make_text().encode()
@@ -550,10 +548,8 @@ class TestGateway:
         client.encode_request(payload)
         wire = client.encode_request(payload)
         st.clear()
-        payload_out, session = gw.TailGateway(st).collect_payload([wire])
-        assert session.missing
-        assert session.status == gw.CACHE_DEGRADED
-        assert payload_out == {}
+        with pytest.raises(codec.MissingBlock):
+            gw.TailGateway(st).collect_payload([wire])
 
     def test_client_invalidate_after_degrade(self):
         payload = make_payload(turns=5)
@@ -571,7 +567,8 @@ class TestGateway:
         payload = make_payload(turns=6)
         st = storage.MemoryStorage()
         client = gw.TailClient()
-        client.encode_request(payload)
+        cold = client.encode_request(payload)
+        gw.TailGateway(st).collect_payload([cold])      # 冷启动:先让网关存下块
         _, session = gw.TailGateway(st).collect_payload(
             [client.encode_request(payload)])
         assert session.hit_ratio == 1.0

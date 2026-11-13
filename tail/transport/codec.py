@@ -213,26 +213,27 @@ class Decoder:
         if dec.missing: retransmit()
     """
 
-    __slots__ = ("_frames", "_source", "_strict", "_on_new_block",
-                 "missing", "new_blocks", "ref_count", "unresolved", "_closed")
+    __slots__ = ("_frames", "_source", "_on_new_block",
+                 "missing", "new_blocks", "ref_count", "_closed")
 
     def __init__(self, source: BlockSource,
-                 strict: bool = False,
                  on_new_block=None) -> None:
         """
         Args:
           source: 块内容来源
-          strict: True 时缺块抛 :class:`MissingBlock`;False 时记录到
-                  :attr:`missing` 并跳过
           on_new_block: 收到新块帧时的回调 ``(block_hash, content)``,
                         用于把新块写入存储
+
+        缺块**必须立刻抛** :class:`MissingBlock`,没有「跳过继续解」这一档。
+        跳过会产出带洞的文本:洞落在 UTF-8 多字节字符中间时,后续片段的首字节
+        不合法(实测 ``UnicodeDecodeError``);洞落在 message 边界时,拼出的
+        prompt 语义已经变了却仍是合法 JSON,会被**静默转发给上游**,白跑一次
+        推理再把结果丢掉。两种都不该发生。
         """
         self._frames = frames.FrameDecoder()
         self._source = source
-        self._strict = strict
         self._on_new_block = on_new_block
         self.missing: List[bytes] = []
-        self.unresolved: List[bytes] = []   # 本轮尚不能确定是否缺失的引用帧
         self.new_blocks: Dict[bytes, bytes] = {}
         self.ref_count = 0
         self._closed = False
@@ -257,9 +258,7 @@ class Decoder:
                     content = self._source.get_many([bid]).get(bid)
                 if content is None:
                     self.missing.append(bid)
-                    if self._strict:
-                        raise MissingBlock(bid)
-                    continue
+                    raise MissingBlock(bid)
                 yield content
 
     def finish(self) -> None:
@@ -275,10 +274,9 @@ class Decoder:
         return self._frames.eof_ok and not self.missing
 
 
-def decode_all(data: bytes, source: BlockSource,
-               strict: bool = False) -> Tuple[bytes, Decoder]:
-    """一次性解码(测试用)。返回 (文本, 解码器)。"""
-    dec = Decoder(source, strict=strict)
+def decode_all(data: bytes, source: BlockSource) -> Tuple[bytes, Decoder]:
+    """一次性解码(测试用)。返回 (文本, 解码器)。缺块抛 :class:`MissingBlock`。"""
+    dec = Decoder(source)
     out = b"".join(dec.feed(data))
     dec.finish()
     return out, dec

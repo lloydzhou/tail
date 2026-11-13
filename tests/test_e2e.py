@@ -207,6 +207,39 @@ class TestEndToEnd:
             r = _post(tc, client.encode_request(payload))
         assert r.headers[gw.HEADER_RETRANSMIT] == "1"
 
+    def test_mid_block_miss_returns_409_without_inference(self, gateway_app, backend):
+        """块洞落在正文中间:必须干净地返回 409 + 重发信号,而不是抛异常。
+
+        以前的行为是「跳过缺块继续解」,洞落在 UTF-8 多字节字符中间时后续片段
+        首字节非法,解码抛 UnicodeDecodeError;洞落在 message 边界时则拼出一条
+        语义已经变了的合法 prompt,白跑一次上游推理。
+        """
+        rng = random.Random(7)
+        # 中文正文每字 3 字节,512B 块边界必然切开多字节字符 → 洞会制造非法 UTF-8
+        payload = {"model": "x", "messages": [
+            {"role": "user", "content": _sent(rng, 400)},
+            {"role": "assistant", "content": _sent(rng, 400)},
+            {"role": "user", "content": "继续"},
+        ]}
+        client = gw.TailClient()
+        cold = client.encode_request(payload)
+        with TestClient(gateway_app) as tc:
+            assert _post(tc, cold).status_code == 200
+            before = len(backend.state.received)
+            ids = list(gateway_app.state.storage._data)
+            assert len(ids) >= 3, "需要足够多的块才能挖中间洞"
+            gateway_app.state.storage._data.pop(ids[1])     # 挖掉中间一块
+            r = _post(tc, client.encode_request(payload))
+            assert r.status_code == 409
+            assert r.headers.get(gw.HEADER_RETRANSMIT) == "1"
+            assert r.headers.get(gw.HEADER_STATUS) == gw.CACHE_DEGRADED
+            assert len(backend.state.received) == before, "缺块时不该有上游推理"
+            # 客户端按重发信号重来一次:恢复成正确请求
+            client.invalidate()
+            r2 = _post(tc, client.encode_request(payload))
+            assert r2.status_code == 200
+            assert backend.state.received[-1]["messages"] == payload["messages"]
+
     def test_client_retransmit_recovers(self, gateway_app, backend):
         rng = random.Random(6)
         payload = {"model": "x", "messages": [
