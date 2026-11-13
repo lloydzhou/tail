@@ -314,18 +314,14 @@ def main(argv: Optional[list] = None) -> None:
                         help="上游 base URL,例如 https://api.deepseek.com")
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=8765)
-    parser.add_argument("--redis", default="",
-                        help="Redis URL,例如 redis://127.0.0.1:6379/0;"
-                             "不填用进程内存储(重启即丢,只适合开发)")
+    parser.add_argument("--redis", required=True,
+                        help="Redis URL,例如 redis://127.0.0.1:6379/0(唯一存储后端)")
     parser.add_argument("--ttl", type=int, default=1800,
                         help="块过期秒数(默认 1800;读前缀时整条续期)")
-    parser.add_argument("--cache-blocks", type=int, default=20_000,
-                        help="进程内 L1 缓存的块数(0 表示不用 L1,直接打 Redis)")
     parser.add_argument("--log-level", default="info")
     args = parser.parse_args(argv)
 
-    storage = make_store(args.redis, ttl=args.ttl or None,
-                         cache_blocks=args.cache_blocks)
+    storage = make_store(args.redis, ttl=args.ttl or None)
     app = build_app(args.backend, storage)
     import uvicorn
     uvicorn.run(app, host=args.host, port=args.port, log_level=args.log_level)

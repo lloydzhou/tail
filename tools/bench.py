@@ -501,10 +501,12 @@ def bench_redis() -> None:
     print(f"| **读整条前缀** | **2** | **{t_both * 1e3:.2f} ms** | 热请求每轮的存储成本 |")
     print()
     ceiling = 1 / t_both
-    print(f"单实例上限约 **{ceiling:,.0f} req/s**(只读、每条都是 829 KB 全量前缀、不计网络与 L1)。")
+    print(f"单个 Redis 实例的上限约 **{ceiling:,.0f} req/s**:只读、每条请求都走完整条 "
+          f"829 KB 前缀,不计网络其余开销。")
     print()
-    print(f"`CachedChainStore` 的 L1 命中后完全不碰 Redis;按 3,333 req/s 的规模算,"
-          f"单个实例需要 {3333 / ceiling:.1f} 倍这样的容量,所以 L1/分片不是优化项而是前提。")
+    print("这个值由「每请求从 Redis 搬走 829 KB + 1,774 跳」决定,与 Lua 无关。")
+    print(f"按 3,333 req/s(10 万在线 / 30 s 一轮)算,单实例差 {3333 / ceiling:.0f} 倍;")
+    print("只能靠分片(按会话键,线性)或更长的块(跳数降、每轮尾块上限变大)。")
     print()
 
     # Lua 脚本自身的固定开销:块数少的时候是常数
@@ -514,8 +516,8 @@ def bench_redis() -> None:
         tt = _best_wall(lambda: store.resolve(tip, k), samples=5)
         print(f"| {k} | {tt * 1e3:.3f} ms |")
     print()
-    print("走链是 O(块数)、每块一次 GET。真正的瓶颈是每请求 1,774 次顺序 GET,")
-    print("不是 Lua 的固定开销——所以 L1 缓存与缩短前缀(truncation)才是解法。")
+    print("走链是 O(块数),每块一次 GET + 一次 EXPIRE。瓶颈是「每请求 1,774 跳顺序读」")
+    print("加「829 KB 出 Redis」这两项,不是 Lua 的固定开销。")
     store.clear()
 
 
@@ -569,7 +571,7 @@ def bench_method() -> None:
 
 
 # ---------------------------------------------------------------------------
-# 8. 存储层次:同一条前缀在 L1 / 内存 / Redis 上的读成本
+# 8. 存储:同一条前缀在进程内替身与 Redis 上的读成本
 # ---------------------------------------------------------------------------
 
 def bench_store_tiers() -> None:
@@ -585,27 +587,20 @@ def bench_store_tiers() -> None:
 
     memory = storage.MemoryChainStore()
     memory.put_chain(b"", items)
-    l1 = storage.CachedChainStore(storage.MemoryChainStore(), capacity=100_000)
-    l1.put_chain(b"", items)
-    l1.resolve(tip, n)                       # 预热 L1
 
     def read(store) -> int:
         return len(store.get_many(store.resolve(tip, n) or []))
 
     t_mem = _best(lambda: read(memory))
-    t_l1 = _best(lambda: read(l1))
 
-    print("### 存储层次:读一条 829 KB 前缀(1774 块)")
+    print("### 存储:读一条 829 KB 前缀(1,774 块)")
     print()
-    print("| 层次 | 单次读耗时 | 单实例上限 |")
+    print("| 实现 | 单次读耗时 | 单实例上限 |")
     print("|---|---|---|")
-    print(f"| `MemoryChainStore`(进程内) | {t_mem * 1e3:.2f} ms | {1 / t_mem:,.0f} req/s |")
-    print(f"| `CachedChainStore` L1 命中 | {t_l1 * 1e3:.2f} ms | **{1 / t_l1:,.0f} req/s** |")
+    print(f"| `MemoryChainStore`(进程内,仅测试替身) | {t_mem * 1e3:.2f} ms | {1 / t_mem:,.0f} req/s |")
     print()
-    row = [("L1(纯内存走链)", t_l1), ("Redis(Lua 走链 + MGET)", None)]
-    print("L1 命中时完全不碰网络,走链是 1774 次 Python 字典查表;Redis 的对应数字见下段。")
-    print("**每请求的存储成本与上下文长度成正比**,这是 v3 引入走链后的固有代价,")
-    print("所以热会话必须有 L1,否则 Redis 单实例撑不住(见下)。")
+    print("生产只有一个后端:Redis(读成本见上一段:走链 Lua + MGET)。")
+    print("**每请求的存储成本与上下文长度成正比**,这是链式前缀的固有代价。")
     print()
 
 

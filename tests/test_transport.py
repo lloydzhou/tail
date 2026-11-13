@@ -486,31 +486,6 @@ class TestChainStore:
     def test_make_store_default(self):
         assert isinstance(storage.make_store(""), storage.MemoryChainStore)
 
-    def test_cached_store_serves_from_l1(self):
-        """L1 命中时不该再问 L2(走链 1,600 跳的成本必须被吃掉)。"""
-        calls = {"resolve": 0, "get_many": 0}
-
-        class Spy(storage.MemoryChainStore):
-            def resolve(self, tip, n_blocks):
-                calls["resolve"] += 1
-                return super().resolve(tip, n_blocks)
-
-            def get_many(self, ids):
-                calls["get_many"] += 1
-                return super().get_many(ids)
-
-        inner = Spy()
-        store = storage.CachedChainStore(inner, capacity=1000)
-        blocks = storage.text_blocks(b"a" * 512 * 4, 512)
-        tip = store.put_chain(b"", blocks)
-        ids = store.resolve(tip, 4)
-        assert ids is not None
-        before = dict(calls)
-        assert store.resolve(tip, 4) == ids
-        assert calls == before, "L1 应当直接命中,不碰 inner"
-        assert store.get_many(ids)[ids[0]] is not None
-
-
 # ---------------------------------------------------------------------------
 # 网关协议层
 # ---------------------------------------------------------------------------
