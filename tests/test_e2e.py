@@ -47,11 +47,9 @@ def gateway_app(backend):
     return app
 
 
-def _post(tc, body, session=b"", have_len=0, have_tip=b""):
-    """按 v3 线缆发一个请求:会话键 + 前缀凭据走头,body 只有尾部字节。"""
+def _post(tc, body, have_len=0, have_tip=b""):
+    """按 v3 线缆发一个请求:前缀凭据走头,body 只有尾部字节。"""
     headers = {"content-type": gw.CONTENT_TYPE_BLOCKS}
-    if session:
-        headers[gw.HEADER_SESSION] = session.hex()
     if have_len:
         headers[gw.HEADER_HAVE] = f"{have_len};{have_tip.hex()}"
     return tc.post("/v1/chat/completions", content=body, headers=headers)
@@ -61,7 +59,7 @@ def _send(tc, client, payload):
     """客户端 prepare → 发 → 用响应头更新凭据。返回 (响应, 线上字节数)。"""
     prepared = client.prepare(payload)
     body = b"".join(prepared.body)
-    r = _post(tc, body, prepared.session, prepared.have_len, prepared.have_tip)
+    r = _post(tc, body, prepared.have_len, prepared.have_tip)
     if r.status_code == 200:
         client.update_from_headers(prepared.session, r.headers)
     return r, len(body)
@@ -147,8 +145,7 @@ class TestEndToEnd:
                 return await client.post(
                     "http://tail.test/v1/chat/completions",
                     content=gen(),
-                    headers={"content-type": gw.CONTENT_TYPE_BLOCKS,
-                             gw.HEADER_SESSION: prepared.session.hex()})
+                    headers={"content-type": gw.CONTENT_TYPE_BLOCKS})
 
         r = asyncio.run(run())
         assert r.status_code == 200

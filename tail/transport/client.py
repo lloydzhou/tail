@@ -25,7 +25,7 @@ import json
 from typing import Any, Dict, Optional
 
 from .gateway import (CONTENT_TYPE_BLOCKS, HEADER_HAVE, HEADER_RETRANSMIT,
-                      HEADER_SESSION, TailClient)
+                      TailClient)
 
 #: 只处理这个路径的请求。其余(embeddings / models / files…)直接透传。
 CHAT_PATH_MARKER = "/chat/completions"
@@ -140,7 +140,6 @@ class TailTransport:
     def _send(self, request: Any, payload: Dict[str, Any]) -> Any:
         prepared = self._client.prepare(payload)
         headers = {
-            HEADER_SESSION: prepared.session.hex(),
             HEADER_HAVE: (f"{prepared.have_len};{prepared.have_tip.hex()}"
                           if prepared.have_len else ""),
         }
@@ -208,7 +207,6 @@ class TailAsyncTransport:
     async def _send(self, request: Any, payload: Dict[str, Any]) -> Any:
         prepared = self._client.prepare(payload)
         headers = {
-            HEADER_SESSION: prepared.session.hex(),
             HEADER_HAVE: (f"{prepared.have_len};{prepared.have_tip.hex()}"
                           if prepared.have_len else ""),
         }

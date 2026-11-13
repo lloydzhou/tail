@@ -6,7 +6,6 @@ v3 线缆
 
     POST /v1/chat/completions
     Content-Type: application/x-tail-v3
-    X-Tail-Session: <32 hex>        # 会话键 = 渲染文本首块的哈希
     X-Tail-Have: <L>;<32 hex>       # 可选:客户端认为网关已持有的前缀
     body: 渲染文本第 L 字节之后的原始字节
 
@@ -17,6 +16,10 @@ v3 线缆
     X-Tail-Status: hit|miss|degraded
     X-Tail-Hit: 0.97
     (前缀失效时 409 + X-Tail-Retransmit: 1)
+
+会话键(渲染文本首块的哈希)是**客户端内部的变量**,不上线:它只是客户端那张
+「会话键 → [(L, tip), ...]」凭据表的主键,发送前由内容算出来即可。服务端不需要它——
+`(L, tip)` 自洽:拿 tip 走链,走不通就回 409。
 
 与 v2 的差别:没有帧、没有逐块引用、客户端不发任何哈希。
 """
@@ -39,7 +42,6 @@ HEADER_VERSION = "X-Tail-Version"
 HEADER_STATUS = "X-Tail-Status"
 HEADER_HIT = "X-Tail-Hit"
 HEADER_RETRANSMIT = "X-Tail-Retransmit"
-HEADER_SESSION = "X-Tail-Session"
 HEADER_HAVE = "X-Tail-Have"
 
 CACHE_HIT = "hit"
@@ -71,16 +73,6 @@ def decode_have(value: Optional[str]) -> Tuple[int, bytes]:
     if length <= 0 or len(tip) != chunking.BLOCK_ID_SIZE:
         return 0, b""
     return length, tip
-
-
-def decode_session(value: Optional[str]) -> bytes:
-    if not value:
-        return b""
-    try:
-        raw = bytes.fromhex(value)
-    except ValueError:
-        return b""
-    return raw if len(raw) == chunking.BLOCK_ID_SIZE else b""
 
 
 # ---------------------------------------------------------------------------
