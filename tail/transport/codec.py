@@ -60,7 +60,7 @@ def _coalesce(pieces: Iterator[bytes], limit: int = OUTPUT_CHUNK) -> Iterator[by
 class PreparedRequest:
     """一次准备好的请求:头里的凭据 + 要发的尾部字节流。"""
 
-    session: bytes
+    session: bytes           # 首块哈希:客户端内部的凭据表主键,不上线
     have_len: int
     have_tip: bytes
     body: Iterator[bytes]

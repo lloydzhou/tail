@@ -96,7 +96,8 @@ class TestTailTransport:
         assert response.status_code == 200
         request, body = inner.requests[-1]
         assert request.headers["content-type"] == gw.CONTENT_TYPE_BLOCKS
-        assert len(request.headers[gw.HEADER_SESSION]) == 32
+        # 会话键是客户端内部变量,不上线:服务端只需要 (L, tip)
+        assert "x-tail-session" not in request.headers
         assert gw.HEADER_HAVE not in request.headers      # 冷启动没有凭据
         assert body.startswith(b"<|model|>")             # 发的是渲染文本,不是 JSON
         assert response.headers[gw.HEADER_HAVE]

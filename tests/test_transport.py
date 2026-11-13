@@ -501,12 +501,6 @@ class TestGateway:
         assert gw.decode_have("垃圾") == (0, b"")
         assert gw.decode_have("1536;short") == (0, b"")
 
-    def test_session_header_roundtrip(self):
-        raw = bytes(range(16))
-        assert gw.decode_session(raw.hex()) == raw
-        assert gw.decode_session("zz") == b""
-        assert gw.decode_session(None) == b""
-
     def test_full_roundtrip_keeps_content_and_params(self):
         store = storage.MemoryChainStore()
         payload = make_payload(turns=5)

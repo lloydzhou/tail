@@ -232,15 +232,15 @@ DeepSeek 上下文硬盘缓存、vLLM 前缀缓存那套「固定间隔、只缓
 ```
 POST /v1/chat/completions
 Content-Type: application/x-tail-v3
-X-Tail-Session: 3f2ab0c9...            # 会话键 = 渲染文本首块的块哈希(16 B,hex)
 X-Tail-Have: 46208;9c1e77d3...         # 可选:客户端认为网关已持有前 46,208 字节,
                                        #       且那段前缀的链尾哈希是 9c1e77d3...
 <body>: 渲染文本第 L 字节之后的全部字节(纯文本,原样)
 ```
 
 - 首次请求不带 `X-Tail-Have`(或值为空)= 从 0 开始,body 就是整段渲染文本。
-- `X-Tail-Session` 用内容寻址:首块哈希。同一段 `tools`+`system` 前缀的会话天然同键,
-  客户端不必发明 id。
+- **没有会话 id 这个头**。会话键(渲染文本首块的块哈希)是**客户端内部的变量**:它只是
+  客户端那张「会话键 → [(L, tip), ...]」凭据表的主键,发送前由内容算出来即可。
+  网关不需要它——`(L, H)` 自洽:拿 H 走链,走不通就 409。
 - L 必须是 512 的整数倍(网关按 `L - L % 512` 对齐,不信任客户端声称的未对齐边界)。
 
 ### 5.2 响应
@@ -318,7 +318,7 @@ v3 把切块与哈希整体搬到网关(§6.0 ⑤⑥),于是:
     │             凭据作废,从 0 重发
     │    ★ 只做**只读校验**:客户端不写任何哈希;0.89 ms / 242 KB,O(1) 内存
     ▼
-  ④ 发送:请求头 X-Tail-Have: L;H   X-Tail-Session: <会话键>
+  ④ 发送:请求头 X-Tail-Have: L;H
           body = 渲染文本第 L 字节之后的原始字节(不是帧)
           ★ 全命中时线上只剩「不满一块的尾巴」:829 KB 上下文计算值 315 B
     ▼
@@ -410,7 +410,7 @@ v3 把切块与哈希整体搬到网关(§6.0 ⑤⑥),于是:
 request.read()                  → 已序列化的 JSON body
 json.loads                      → payload dict
 client.prepare(payload)         → 凭据 (session, L, H) + 尾部字节流(不落地、不拼大 bytes)
-Content-Type → application/x-tail-v3,带上 X-Tail-Session / X-Tail-Have,删掉 Content-Length(改 chunked)
+Content-Type → application/x-tail-v3,带上 X-Tail-Have,删掉 Content-Length(改 chunked)
 内层 transport.handle_request   → 真正发出
 200 响应                        → update_from_headers():把服务端给的下一轮凭据存回本地表
 响应带 X-Tail-Retransmit        → client.invalidate() 后全量重发一次
@@ -438,8 +438,9 @@ embeddings、文件上传）原样透传。body 不是合法 JSON 时也不猜�
    所以它重渲染并逐块算父链哈希,走到第 `L/512` 块时与 `H` 比对:
    相等 → 前 L 字节逐字节相同(渲染确定性),从 L 往后发;不等 → 凭据作废,从 0 发。
    **这是游戏规则的关键**:客户端永远只做只读校验,绝不声称任何新哈希。
-3. **会话键** = 渲染文本首块的块哈希。它同时是内容寻址的会话标识(同前缀同键)
-   和响应绑回请求的索引;客户端在 `X-Tail-Session` 里带上,网关按它回显凭据。
+3. **会话键** = 渲染文本首块的块哈希,是**客户端内部的凭据表主键**(同前缀同键,
+   内容寻址,客户端不必发明 id),**不上线**。服务端只按 `(L, H)` 查,不需要知道
+   是哪个会话;响应里的 `X-Tail-Have` 也由客户端自己绑回这个键。
 
 **必须复用同一个 client 实例**——凭据表挂在 `TailClient` 上,每轮新建
 `OpenAI(...)` 就等于永远冷启动(实测:6 轮合计 14,109 B vs 5,405 B,差 62%)。
@@ -536,7 +537,7 @@ v2 时这里更尖锐(每个 17 B 引用帧都会变成一个 chunk),v3 已经�
 | ⑥⑦ 存储读 | `get_many(refs)` → Redis MGET;扁平 `blk:{hash} → 内容` | 按 `(L, H)` 走一条 Lua 脚本走完整条链,正文随 value 返回;`blk:{hash} → parent‖content` |
 | ⑧ 切块/哈希 | 客户端 `BlockHasher` | **网关**按 L 对齐切块 + 父链哈希(客户端只做只读自检) |
 | ⑨⑩ 反渲染/转发 | `RenderParser` + `_AsyncJsonStream` | 同 |
-| 响应头 | Version / Status / Hit / Retransmit | 增加 `X-Tail-Have`、`X-Tail-Session` |
+| 响应头 | Version / Status / Hit / Retransmit | 增加 `X-Tail-Have`(下一轮凭据) |
 | 代码 | `codec.Encoder/Decoder`、`frames.py`、`storage.MemoryStorage` | `codec.PrefixClient/PrefixReader`、`storage.ChainStore` 家族;`frames.py` 已删 |
 
 迁移后的实测差异(均为 §9 的数字):
@@ -1011,7 +1012,7 @@ Tail 合计(上下文, B) = 上表开销(上下文) + 尾巴字节 ÷ B
 
 | 问题 | 结论 |
 |---|---|
-| **哈希投毒**(v2 阻断项):服务端无法校验客户端声称的块哈希 | **结构上消除**。v3 客户端一个哈希都不发:`X-Tail-Session` 与 `X-Tail-Have.tip` 只用于**查**,新块哈希全部由网关算、网关写。客户端即使发错,也只是落到一棵无关的链上(等于 miss),不会污染别人的块 |
+| **哈希投毒**(v2 阻断项):服务端无法校验客户端声称的块哈希 | **结构上消除**。v3 客户端一个哈希都不发:`X-Tail-Have.tip` 只用于**查**,新块哈希全部由网关算、网关写。客户端即使发错,也只是落到一棵无关的链上(等于 miss),不会污染别人的块 |
 | 凭据追加判定(compact / 改中间消息) | 客户端发之前**重算整条前缀的父链哈希**,只有恰好走到某个已知 `(L, tip)` 才复用;对不上就从 0 发。`TestPrefixClient::test_edit_middle_falls_back`、`test_changed_param_refalls` 覆盖 |
 | 并发乱序(同一会话两个请求在飞) | 每会话保留**最近 4 个凭据**(MRU),乱序返回的两个 `(L', tip')` 都能被后续请求匹配上;过期凭据只会 miss,不会错拼。`test_bounded_credentials` 覆盖 |
 | 会话键冲突(首 512 B 相同) | **按特性处理**:会话键就是首块哈希,内容寻址。共用凭据不产生错误——服务端按 `(L, tip)` 走链,内容不同必然链尾不同,匹配不上就退化成 miss |
@@ -1042,6 +1043,8 @@ Tail 合计(上下文, B) = 上表开销(上下文) + 尾巴字节 ÷ B
 1. **TTL 取值**:块 TTL 决定「会话空闲多久之后第一轮退化成全量」。经验上取 30~60 分钟。
 2. **块大小**:512 B 还是 1~4 KB,决定每请求跳数与尾块重发上限(§7.5)。
 3. **Redis 分片键**:按会话键(首块哈希)分片最自然——同一会话的所有块落在同一实例,走链不跨机。
+   **注意**:会话键现在不上线(客户端内部变量);真要做按会话分片,需要把它重新放回请求头,
+   或退一步用 `X-Tail-Have.tip` 当分片键(缺点是链尾每轮变,分片会漂移)。
 4. **前缀截断**:要不要只保留最近 N 块。截断会降低命中率,但把每请求的走链跳数封顶。
 
 ### 建议按这个顺序核对

@@ -318,12 +318,11 @@ resp = httpx2.post(
     "http://127.0.0.1:8765/v1/chat/completions",
     content=prepared.body,                      # 生成器，边渲染边发
     headers={"content-type": "application/x-tail-v3",
-             "x-tail-session": prepared.session.hex(),
              "x-tail-have": (f"{prepared.have_len};{prepared.have_tip.hex()}"
                              if prepared.have_len else ""),
              "authorization": f"Bearer {api_key}"},
 )
-client.update_from_headers(prepared.session, resp.headers)   # 拿回下一轮凭据
+client.update_from_headers(prepared.session, resp.headers)   # session 是本地键,不上线
 if resp.headers.get("x-tail-retransmit"):
     client.invalidate()                        # 前缀失效，下一轮重发全文
 ```
@@ -336,7 +335,6 @@ if resp.headers.get("x-tail-retransmit"):
 ```
 POST /v1/chat/completions
 content-type: application/x-tail-v3
-x-tail-session: 3f2ab0c9…                会话键 = 渲染文本首块的块哈希（16 B）
 x-tail-have: 46208;9c1e77d3…             可选：我认为你已有前 46,208 B，链尾是 9c1e…
 
 <body>                                   渲染文本第 L 字节之后的全部字节
