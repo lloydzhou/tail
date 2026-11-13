@@ -273,6 +273,34 @@ class TestRender:
 class TestStreamingRender:
     """渲染器与反渲染器都必须能吃任意字节边界的片段。"""
 
+    def test_split_right_after_backslash(self):
+        """定向边界:正文以反斜杠结尾,且切块点**恰好落在反斜杠之后**。
+
+        这时下一块的第一个引号可能是"被转义的",不是字符串边界。随机测试不保证
+        命中这个位置,所以这里把每个切点都试一遍。
+
+        回归:曾用 ``str.find`` 跳跃找引号,跨块时反斜杠状态丢失,
+        400 例模糊测试里 235 例流式解析出错。
+        """
+        # 正文以反斜杠结尾(JSON 里是 "a\\"),再加一条含引号的消息
+        payload = {"model": "m", "messages": [
+            {"role": "user", "content": "a\\"},
+            {"role": "assistant", "content": '他说"你好"然后走了'},
+            {"role": "user", "content": '再次 "引号" 与 \\ 反斜杠'},
+        ]}
+        text = render.render_request(payload)
+        assert render.unrender_request(text) == payload
+
+        # 在每个位置切一刀,两段分别喂入,结果必须一致
+        for cut in range(len(text) + 1):
+            parser = render.RenderParser()
+            events = list(parser.feed(text[:cut]))
+            events += list(parser.feed(text[cut:]))
+            events += list(parser.finish())
+            got = [e[1] for e in events
+                   if e[0] == render.EventKind.MESSAGE_END]
+            assert got == payload["messages"], f"切点 {cut} 下解析结果不一致"
+
     @pytest.mark.parametrize("seed", range(6))
     def test_roundtrip_with_hostile_content(self, seed):
         """正文里带标记、引号、反斜杠、换行时,任意切块都要往返一致。

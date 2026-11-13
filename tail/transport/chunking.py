@@ -13,7 +13,7 @@ vLLM:https://docs.vllm.ai/en/v0.8.3/_sources/design/v1/prefix_caching.md
   1. **定长块(block_size)**,块边界只由位置决定,与内容无关。
   2. **块哈希 = hash(父块哈希 + 本块 tokens + 额外哈希)**::
 
-         block_hash = hash(parent_hash, block_tokens, extra_hashes)
+         block_hash = hash(parent_hash, block_tokens)
 
      父哈希让相同内容挂在不同前缀下得到不同 id,这就是"前缀"语义。
   3. **只缓存满块**:"We only cache full blocks"。
@@ -54,26 +54,22 @@ BLOCK_ID_SIZE = 16
 _HASH_NAME = "blake2b"
 
 
-def block_hash(block: bytes, parent_hash: bytes = b"",
-               extra: bytes = b"") -> bytes:
-    """块哈希 = hash(父哈希 + 本块 + 额外哈希),与 vLLM 一致。
+def block_hash(block: bytes, parent_hash: bytes = b"") -> bytes:
+    """块哈希 = hash(父哈希 + 本块),与 vLLM 一致。
 
     Args:
       block: 本块内容。
       parent_hash: 前一个满块的哈希;第一块为 ``b""``(vLLM 的 ``None``)。
-      extra: 额外哈希(如工具集指纹),用于让本层的块不与其他层混同。
     """
     h = hashlib.new(_HASH_NAME, digest_size=BLOCK_ID_SIZE)
     h.update(parent_hash)
     h.update(block)
-    h.update(extra)
     return h.digest()
 
 
-def block_hash_hex(block: bytes, parent_hash: bytes = b"",
-                   extra: bytes = b"") -> str:
+def block_hash_hex(block: bytes, parent_hash: bytes = b"") -> str:
     """十六进制形式,便于日志与调试。"""
-    return block_hash(block, parent_hash, extra).hex()
+    return block_hash(block, parent_hash).hex()
 
 
 def split(data: bytes, block_size: int = BLOCK_SIZE) -> List[Tuple[int, int]]:
@@ -91,8 +87,8 @@ def split_blocks(data: bytes,
         yield data[s:e]
 
 
-def blocked_hashes(data: bytes, block_size: int = BLOCK_SIZE,
-                   extra: bytes = b"") -> List[Tuple[bytes, bool]]:
+def blocked_hashes(data: bytes,
+                   block_size: int = BLOCK_SIZE) -> List[Tuple[bytes, bool]]:
     """切块并算哈希,返回 ``[(block_hash, is_full), ...]``。
 
     哈希链只串满块——与原实现一致,不满的尾块不进入链,
@@ -103,7 +99,7 @@ def blocked_hashes(data: bytes, block_size: int = BLOCK_SIZE,
     for s, e in split(data, block_size):
         chunk = data[s:e]
         full = (e - s) == block_size
-        bid = block_hash(chunk, parent, extra)
+        bid = block_hash(chunk, parent)
         out.append((bid, full))
         if full:
             parent = bid
@@ -111,11 +107,10 @@ def blocked_hashes(data: bytes, block_size: int = BLOCK_SIZE,
 
 
 def blocked_to_blocks(data: bytes,
-                      block_size: int = BLOCK_SIZE,
-                      extra: bytes = b"") -> List[Tuple[bytes, bytes]]:
+                      block_size: int = BLOCK_SIZE) -> List[Tuple[bytes, bytes]]:
     """切块并算哈希,返回 ``[(block_hash, block_bytes), ...]``。"""
     return [(bid, data[s:e])
-            for (bid, _full), (s, e) in zip(blocked_hashes(data, block_size, extra),
+            for (bid, _full), (s, e) in zip(blocked_hashes(data, block_size),
                                             split(data, block_size))]
 
 
@@ -135,14 +130,12 @@ class BlockHasher:
             ...
     """
 
-    __slots__ = ("_block_size", "_buf", "_parent", "_extra")
+    __slots__ = ("_block_size", "_buf", "_parent")
 
-    def __init__(self, block_size: int = BLOCK_SIZE,
-                 extra: bytes = b"") -> None:
+    def __init__(self, block_size: int = BLOCK_SIZE) -> None:
         self._block_size = block_size
         self._buf = bytearray()
         self._parent = b""              # 链上前一个满块的哈希
-        self._extra = extra
 
     def feed(self, data: bytes) -> Iterator[Tuple[bytes, bytes]]:
         """喂入字节,产出 ``(block_hash, block)``。只产出**满块**。"""
@@ -152,7 +145,7 @@ class BlockHasher:
         while len(self._buf) >= size:
             block = bytes(self._buf[:size])
             del self._buf[:size]
-            bid = block_hash(block, self._parent, self._extra)
+            bid = block_hash(block, self._parent)
             self._parent = bid
             yield bid, block
 
@@ -164,4 +157,4 @@ class BlockHasher:
         if self._buf:
             block = bytes(self._buf)
             self._buf = bytearray()
-            yield block_hash(block, self._parent, self._extra), block
+            yield block_hash(block, self._parent), block

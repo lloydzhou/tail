@@ -135,6 +135,10 @@ class _AsyncToSyncBody:
         self._request = request
         self._queue: "queue.Queue[Optional[bytes]]" = queue.Queue(maxsize)
         self._task: Optional[asyncio.Task] = None
+        # 后台泵的异常。必须显式记录并在消费端抛出:否则异常被 asyncio.Task
+        # 捕获且无人 await,消费端只看到哨兵、当成正常结束,结果是**把被截断的
+        # 请求静默转发给上游**,没有任何错误信号。
+        self._error: Optional[BaseException] = None
 
     async def _pump(self) -> None:
         loop = asyncio.get_running_loop()
@@ -144,6 +148,8 @@ class _AsyncToSyncBody:
                     # queue 满时 put 会阻塞,但这是同步调用会卡住事件循环,
                     # 所以放到线程池里等,保持背压同时不堵 loop。
                     await loop.run_in_executor(None, self._queue.put, chunk)
+        except BaseException as exc:          # noqa: BLE001 — 必须捕获后转交
+            self._error = exc
         finally:
             await loop.run_in_executor(None, self._queue.put, None)   # 哨兵
 
@@ -158,6 +164,9 @@ class _AsyncToSyncBody:
         while True:
             chunk = self._queue.get()
             if chunk is None:
+                # 哨兵:区分"正常结束"与"传输出错"
+                if self._error is not None:
+                    raise self._error
                 return
             yield chunk
 

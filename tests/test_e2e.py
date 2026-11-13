@@ -52,6 +52,45 @@ def _post(tc, body):
                    headers={"content-type": gw.CONTENT_TYPE_BLOCKS})
 
 
+class TestAsyncToSyncBody:
+    """请求体异步流 → 同步迭代 的桥接。"""
+
+    def test_stream_error_is_propagated(self):
+        """上游/网络在传输中途出错时,错误必须传给消费端。
+
+        回归:早先 ``_pump`` 的异常被 asyncio.Task 吞掉且无人 await,消费端只看到
+        哨兵、当成正常结束——结果是**把被截断的请求静默转发给上游**。
+        """
+        class _BadRequest:
+            async def stream(self):
+                yield b"a" * 16
+                raise RuntimeError("client disconnected mid-body")
+
+        body = serve._AsyncToSyncBody(_BadRequest())
+
+        async def run():
+            body.start()
+            # __iter__ 会阻塞,必须放到线程里,让事件循环继续跑 pump
+            return await asyncio.to_thread(lambda: list(body))
+
+        with pytest.raises(RuntimeError, match="client disconnected"):
+            asyncio.run(run())
+
+    def test_normal_stream_completes(self):
+        class _OkRequest:
+            async def stream(self):
+                for piece in (b"aa", b"bb", b"", b"cc"):
+                    yield piece
+
+        body = serve._AsyncToSyncBody(_OkRequest())
+
+        async def run():
+            body.start()
+            return await asyncio.to_thread(lambda: list(body))
+
+        assert asyncio.run(run()) == [b"aa", b"bb", b"cc"]
+
+
 class TestEndToEnd:
     def test_upstream_receives_before_client_finishes(self, gateway_app, backend):
         """**全程流式**:上游开始收包时,客户端远没发完。

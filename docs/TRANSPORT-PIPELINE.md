@@ -157,6 +157,10 @@ OpenAI 里 `content: null`、`content` 缺失、`content: ""` 是三种不同语
    ```
 
    父哈希让相同内容挂在不同前缀下得到不同哈希——这就是"前缀"语义。
+
+   本层目前**不用** `extra_hashes`:vLLM 用它区分 LoRA ID 与多模态输入,
+   而这层工作在字节上、不感知 LoRA/多模态。形式上保留位置但不引入空参数,
+   等真有第二种 renderer 需要隔离块空间时再加。
 3. **只缓存满块**("We only cache full blocks")。
 
 DeepSeek 侧对应的是**按固定 token 间隔落盘**(见
@@ -170,7 +174,7 @@ BLOCK_SIZE    = 512                    # 字节
 BLOCK_ID_SIZE = 16                     # 128 bit
 _HASH_NAME    = "blake2b"
 
-block_hash(block, parent_hash=b"", extra=b"") = blake2b(parent_hash + block + extra)
+block_hash(block, parent_hash=b"") = blake2b(parent_hash + block)
 ```
 
 本层工作在**字节**上,因为网关拿不到 tokenizer。
