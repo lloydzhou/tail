@@ -1,253 +1,281 @@
-# Tail —— LLM 上行流量优化网关
+# Tail —— 在 SDK 与上游之间插入一层「文本去重传输层」
 
-> **Tail** — *Send the tail, the head is cached.*
->
-> 名字取自 `tail -f`:只看新增的几行。Tail 把同样的心智模型用到 LLM 请求上——
-> 前缀(头部)已在网关缓存,客户端只发增量(尾部),**透明节省 SDK 与 LLM Gateway 之间的上行流量**。
+> 多轮对话里，每一轮都要把**完整上下文**重新发一遍给上游。上下文越长、轮次越多，
+> 上行带宽浪费越大。Tail 在公网这一跳上只传「引用 + 新增内容」。
 
-## 能省多少?代价多少?
+## 它解决什么问题
 
-长上下文模型(如 **DeepSeek V4**、**GLM-5.2** 等已默认 **1M token** 上下文)下,多轮对话的请求体里 **95%+ 是重复的前缀**。Tail 只发增量,把它压到接近 0。
+一个 100 轮、每轮 1K token 的对话，到第 100 轮时请求体约 400KB，其中 99% 是前 99 轮
+已经传过的内容。Tail 把这些重复内容换成了 16 字节的引用。
 
-### 省了多少上行流量
+实测（20 轮中文对话，每轮追加一轮问答）：
 
-以 **1M token 上下文**为例(DeepSeek V4 / GLM-5.2 已默认 1M,粗估 1 token ≈ 4 字节):
+| 轮次 | 上下文文本 | 线上体积 | 占比 |
+|---|---|---|---|
+| 1（冷启动） | 2.5 KB | 2.5 KB | 100% |
+| 5 | 5.5 KB | 1.7 KB | 30% |
+| 10 | 9.2 KB | 1.8 KB | 20% |
+| 20 | 16.7 KB | 2.1 KB | 13% |
 
-| | 不用 Tail | 用 Tail |
-|---|---|---|
-| 单次请求体 | ~4 MB(完整 messages) | ~2 KB(增量 + hash) |
-| 10 轮对话上行流量 | ~40 MB | 首次 ~4 MB + 9 × ~2 KB ≈ **4 MB** |
-| 节省 | — | **~90%** |
-| 1000 并发对话 × 日均 10 轮 | ~40 GB/天上行 | ~4 GB/天上行 |
+关键性质：**上下文线性增长，线上体积基本持平。**
 
-上下文越长、轮次越多,节省比例越高(极限情况下单轮增量仅占 0.05%,节省 **99.9%**)。对**上行流量计费敏感**的场景(企业内网→公有云 LLM Gateway、跨境调用、移动端)尤其显著。
+## 怎么做的
 
-### 代价:多少临时存储
-
-Tail 的本质是**用临时存储换上行流量**。缓存有 TTL(30 分钟~6 小时,自动过期回收),
-而流量是**一次性消耗**——所以这是一笔极度划算的交易。
-
-按 v2.1 数据结构,一个 1M token 对话(500 回合)的存储开销:
-
-| key 类型 | 数量 | 单条大小 | 小计 |
-|----------|------|---------|------|
-| meta | 1 | 150 B | 150 B |
-| sys(若有) | 1 | ~8 KB | 8 KB |
-| tools(若有) | 1 | ~4 KB | 4 KB |
-| seg(每回合) | 500 | ~8 KB | ~3.8 MB |
-| pfx(Merkle 节点) | 500 | 80 B | ~40 KB |
-| **合计** | | | **~3.9 MB** |
-
-### ROI:存储换流量
-
-同一对话 10 轮:**3.9 MB 存储** 换 **34 MB 上行流量** —— **1 MB 临时存储 ≈ 换 9 MB 流量**。
-
-考虑 TTL 过期回收后的稳态(1000 并发对话,活跃率 30%):
-
-| 指标 | 值 |
-|------|-----|
-| 稳态存储(只保留活跃对话) | ~1.1 GB |
-| 日节省上行流量 | ~60 GB |
-| **比率** | **1 GB 存储 ≈ 换 53 GB/天 流量** |
-
-存储会过期回收,流量消耗不会。以[阿里云公开价格](https://help.aliyun.com/zh/ecs/block-storage-devices)估算:
-用 **~1 GB ESSD 云盘**(¥0.50/GB/月 ≈ ¥0.02/天)
-换 **~60 GB/天的上行流量**(公网按量 ¥0.80/GB ≈ ¥48/天)—— **ROI 约 2500 倍**。
-
----
-
-## 工作原理
-
-```mermaid
-flowchart LR
-    SDK["客户端 SDK<br/>(openai monkey patch)"] -- "精简请求<br/>(hash + 增量)" --> GW["Tail 网关<br/>(FastAPI / Lua)"]
-    GW -- "X-Cache-Hash/Hit" --> SDK
-    GW -- "完整请求(还原后)" --> BE["LLM 推理服务<br/>(DeepSeek / OpenAI / ...)"]
-    GW <-. "缓存读写" .-> KV[("可插拔存储<br/>默认 dbm / 可选 Redis 等")]
+```
+客户端                                        网关
+─────────────────────────────────────────────────────────────
+messages JSON                                 帧流
+  │ ① 渲染器（懂 LLM 语义）                      │ ② 解码器（只认字节）
+  ▼                                             ▼
+一维文本流                                     一维文本流
+  │ ② 编码器（只认字节）                          │ ① 反渲染器（懂 LLM 语义）
+  ▼                                             ▼
+帧流 ─────────── 公网（体积最小的一段）────────→ messages JSON
+                                                   │
+                                                   ▼
+                                                上游推理 API
 ```
 
-1. **首次请求**:客户端发完整 messages → 网关缓存前缀 → 返回 `X-Cache-Hash`
-2. **后续请求**:SDK 自动只发增量 + hash → 网关按 hash 还原完整请求 → 转发后端
-3. **乐观发送 + 自动降级**:默认带 hash,缓存未命中则 SDK 自动重发全量(对调用方完全透明)
+四层，职责单一，可独立替换：
 
-**透明性**:
-- 对**调用方**:openai SDK 用法零改动(`openai_patch.install()` 一行)
-- 对**后端**:收到的是标准完整 OpenAI 请求,无感知
-- 支持 **streaming(SSE)**:网关透明转发流式响应,边收边发不缓冲
+| 层 | 模块 | 输入 → 输出 | 懂 LLM 语义？ |
+|---|---|---|---|
+| 渲染器 | `render.py` | messages JSON → 一维文本 | ✅ |
+| 编码器 | `codec.py` | 一维文本 → 帧流 | ❌ 只认字节 |
+| 解码器 | `codec.py` | 帧流 → 一维文本 | ❌ 只认字节 |
+| 反渲染器 | `render.py` | 一维文本 → messages JSON | ✅ |
+| 分块 | `chunking.py` | 字节 → 块（定长） | ❌ |
+| 存储 | `storage.py` | 块集合 | ❌ |
 
----
+**中间三层完全不知道聊天协议。** 要支持 Anthropic Messages 或 Responses API，
+只需写一个新的 `render` 模块，其余一行都不用改。
 
-## 快速开始(Python 版网关)
+## 三条不变式
 
-### 安装
+1. **渲染必须确定性** —— 同一份 messages 必须渲染成逐字节相同的文本，否则
+   块内容变化、`block_hash` 变化、缓存整体失效。实现上：字段顺序固定、
+   `json.dumps(sort_keys=True)`。格式版本走 HTTP 头，不写进正文。
+2. **中间层无语义** —— 编码器/解码器不知道哪个字节是 role。
+3. **缓存缺失只退化，不报错** —— 取不到块时响应带 `X-Tail-Retransmit: 1`（状态码不变），
+   客户端清空本地已知块集合后重发全文。存储全空、服务重启时系统仍能正常工作。
+
+## 为什么不用原 JSON 直接传
+
+**完整协议、管线与设计动机见 [`docs/TRANSPORT-PIPELINE.md`](docs/TRANSPORT-PIPELINE.md)。**
+
+要点：
+
+- **JSON 是树，块边界没有自然落点。** 渲染成固定格式文本后是一维字节流，
+  块边界按固定 `block_size` 对齐即可（vLLM 的做法）。
+- **前缀缓存消不掉新增消息里的结构字节。** 每条新消息都带 `{"role":"`, `","content":"`
+  这些零信息开销。不过要诚实：正文很长的对话里这只占 3~4%，渲染成文本本身几乎不省
+  （长对话实测只省 3.5%，而 1000 条短消息能省 55%）。**渲染的真正价值是把树摊平成
+  一维字节流，让块能按固定间隔切、跨轮复用。**
+- **尾部增量只能处理追加。** compact、编辑旧消息、重排、中间插入都会导致整条前缀
+  失效；分块去重下只重传受影响的块。
+
+## 快速开始
 
 ```bash
-pip install tail            # 或 pip install -e . (本仓库)
+pip install -e ".[test]"
+
+# 起网关（内存存储；生产用 --dbm 或 --redis）
+python -m tail.serve --backend https://api.deepseek.com --port 8765 --dbm ./blocks.db
 ```
 
-### 启动网关(一行命令,默认零依赖 dbm 存储)
-
-```bash
-# 后端指向真实推理服务即可
-python -m tail.gateway --backend https://api.deepseek.com --port 8765
-```
-
-可选参数:
-```bash
-python -m tail.gateway --backend https://api.deepseek.com \
-    --storage dbm \              # 默认,零依赖(也可 redis 连外部 KV)
-    --dbm-path ./tail_cache.dbm \
-    --miss-mode fast_fail \      # 未命中:fast_fail(412 重试)| passthrough
-    --port 8765
-```
-
-### 客户端使用(零改动)
+客户端：**现有的 `openai` 代码不用改请求逻辑**，只多传一个 `http_client`。
 
 ```python
-from tail import openai_patch
-openai_patch.install()        # 装一次
-
+import httpx2
 from openai import OpenAI
-client = OpenAI(base_url="http://127.0.0.1:8765/v1", api_key="sk-...")
+from tail.transport.client import TailTransport
 
-# 照常用,SDK 自动维护前缀缓存、只发增量、自动降级
-resp = client.chat.completions.create(
-    model="deepseek-chat",
-    messages=[{"role": "user", "content": "Hello"}],
+client = OpenAI(
+    base_url="http://127.0.0.1:8765/v1",
+    api_key="sk-xxx",
+    http_client=httpx2.Client(transport=TailTransport()),   # ← 唯一新增
 )
-# 流式也透明支持
-stream = client.chat.completions.create(
-    model="deepseek-chat",
-    messages=[...], stream=True,
+
+# 下面和原生用法一模一样，流式也一样
+for event in client.chat.completions.create(
+        model="deepseek-chat", messages=messages, stream=True):
+    print(event.choices[0].delta.content or "", end="")
+```
+
+异步用 `AsyncOpenAI` + `httpx2.AsyncClient(transport=TailAsyncTransport())`。
+
+### 客户端只记哈希，不缓存内容
+
+本地状态只有一个「网关已有块」的哈希集合（16 字节/块，约 70 B/块），**不留正文副本**。
+编码时命中就只发 17 字节引用帧。实测约 79 KB 上下文（174 个满块）：
+
+| | |
+| --- | --- |
+| 本地集合占内存 | 1,664 B 纯哈希（104 块，set 实际约 7 KB） |
+| 冷启动上行 | 39,838 B |
+| 全命中后上行 | 1,276 B（省 97%） |
+
+三点要注意：
+
+1. **必须复用同一个 client 实例**——集合挂在 client 上，每轮新建 `OpenAI(...)`
+   等于永远冷启动（6 轮合计 14,745 B vs 5,973 B，差 59%）。
+2. **复用是前缀形状的**——块哈希沿用 vLLM 的父链 `hash(parent, block)`，纯追加几乎
+   免费，往中间插一句则其后全部失效。
+3. **没有逐块 ACK**——客户端乐观假设「发出去的对端就存下了」，对端存储被清空时用
+   `X-Tail-Retransmit` 通知，客户端全量重发一次（多一次往返，不会错内容）。
+
+`TailTransport` 只拦截 `/chat/completions` 的 JSON 请求，其余请求（`/models`、
+embeddings、文件上传……）原样透传；网关回 `X-Tail-Retransmit` 时它自动清空本地
+已知块集合并重发一次全量，对上层透明。
+
+完整可运行示例见 [examples/chat.py](examples/chat.py)（原生）与
+[examples/chat_tail.py](examples/chat_tail.py)（接入 Tail），两者 diff 只有 3 行。
+
+网关也接受普通 `application/json` 请求并原样转发，便于灰度对比与排障。
+
+### 依赖说明：为什么是 `httpx2`
+
+`httpx` 稳定版停在 0.28.1（后续只有 `1.0.dev*` 预发布），继任包是
+[`pydantic/httpx2`](https://github.com/pydantic/httpx2)（同一作者 Tom Christie）。
+`openai` 3.x 已依赖 `httpx2`，Starlette 1.10 的 `TestClient` 也优先用 `httpx2`
+并对 `httpx` 报弃用警告。所以本项目统一用 `httpx2`，客户端与网关只有一套 HTTP 栈。
+
+`TailTransport` 本身与库无关：它按请求对象所属的库自动选择内层 transport，
+因此仍在用 `httpx` 的 `openai` 1.x 也能直接接。
+
+### 直接用底层 API（不用 SDK）
+
+```python
+from tail.transport.gateway import TailClient
+
+client = TailClient()
+body = client.encode_request({"model": "deepseek-chat", "messages": messages})
+resp = httpx2.post(
+    "http://127.0.0.1:8765/v1/chat/completions",
+    content=body,
+    headers={"content-type": "application/x-tail-v2",
+             "authorization": f"Bearer {api_key}"},
 )
+if resp.headers.get("x-tail-retransmit"):
+    client.invalidate()          # 缓存失效，下一轮重发全文
 ```
 
----
+## 线上格式
 
-## 目录结构
+`Content-Type: application/x-tail-v2`，body 为二进制帧流：
 
 ```
-tail/                      # 客户端 + Python 网关(主)
-├── openai_patch.py        # ★ openai SDK monkey patch(指纹校验 + session 隔离 + 自动重试)
-└── gateway/               # ★ Python 网关(FastAPI)
-    ├── app.py             # 路由(三阶段:命中还原/透明转发/streaming SSE)
-    ├── storage.py         # Storage 抽象基类 + DbmStorage(零依赖默认)/ 可插拔
-    ├── segment.py / merkle.py / hashing.py   # v2.1 算法(segment 切分 + Merkle 增量链)
-    ├── protocol.py        # 常量 + GatewayConfig
-    └── __main__.py        # 命令行入口(python -m tail.gateway ...)
-
-openresty/                 # (可选)OpenResty/Lua 版网关,与 Python 版 cache_key 逐字节一致、可互换
-├── conf/nginx.conf
-└── lua/kvcache/           # hashing/segment/merkle/protocol/store/gateway
-
-tests/                     # 测试(Python 网关 + patch 单测 + OpenResty 端到端)
-docs/
-├── DESIGN-chunked-cache.md   # 设计文档(v2.1 Segment-Merkle + 访问驱动续期)
-└── PROTOCOL.md               # ★ 线缆协议规范(X-Cache-* 头 / 412 / cache_key 三段格式)
-run.sh                     # 一键启停(Kvrocks + 网关 + 模拟后端,OpenResty 版用)
+0x01 <block_hash>                      引用：这段内容网关已有
+0x02 <block_hash> <4 字节长度> <块字节>   新块：直传内容
+0x03                                   结束
 ```
 
----
+引用帧固定 17 字节。新块帧带 `block_hash`：哈希是 vLLM 式的
+`hash(父哈希 + 本块)`，解码端不知道父哈希，算不出正确值，必须由发送方随帧传来。
 
-## 协议(摘要)
+用二进制而非 JSON 包一层的理由：无二次转义、可流式解析、引用帧极其紧凑。
 
-**请求方向**(Client → Gateway):
+## 分块与块哈希
 
-| Header | 含义 |
-|--------|------|
-| `X-Cache-Hash` | 可选。上次响应返回的缓存哈希。 |
-| `X-Cache-Prefix-Length` | 可选。该哈希对应的前缀消息条数。 |
+**完全照搬 vLLM Automatic Prefix Caching**
+（[设计文档](https://docs.vllm.ai/en/v0.8.3/_sources/design/v1/prefix_caching.md)），
+没有自创算法：
 
-携带哈希时,`messages` 可只含**增量**;网关负责还原完整 messages。
+```
+block_hash = hash(父块哈希, 本块字节)
+```
 
-**响应方向**(Gateway → Client):
+- **定长块**，块边界只由位置决定，与内容无关。
+- **哈希链**：父哈希让相同内容挂在不同前缀下得到不同哈希，这是"前缀"语义的来源。
+- **只缓存满块**（vLLM: "We only cache full blocks"），尾块不入存储。
 
-| Header | 含义 |
-|--------|------|
-| `X-Cache-Hash` | 本次前缀的新哈希,客户端应保存。 |
-| `X-Cache-Expire` | 缓存过期 Unix 时间戳(带 ±jitter 防雪崩)。 |
-| `X-Cache-Hit` | `true`/`false`,网关是否命中。 |
+DeepSeek 侧对应的是"按固定 token 间隔落盘"
+（[上下文硬盘缓存](https://api-docs.deepseek.com/zh-cn/guides/kv_cache/)），
+同样是固定间隔。
 
-> 完整线缆协议规范(`X-Cache-*` 头语义、`412` 快速失败契约、`cache_key` 三段哈希格式、
-> Segment-Merkle 链、SSE 透传契约)见 **[`docs/PROTOCOL.md`](docs/PROTOCOL.md)**。
+参数：`BLOCK_SIZE = 512` 字节 / `BLOCK_ID_SIZE = 16` 字节 / blake2b。
 
----
+**`BLOCK_SIZE` 是实测调出来的，不能照抄 vLLM 的 16 token。** 本层每块要付
+`1+16` 字节帧头，48 字节（16 token 的中文换算）的块光帧头就占 35%，实测反而更差：
 
-## 与 OpenAI Responses API 对比
+| block_size | 48B | 64B | 128B | 256B | **512B** | 1024B | 4096B |
+|---|---|---|---|---|---|---|---|
+| 20 轮对话省 | -2% | 19% | 52% | 66% | **69%** | 68% | 26% |
 
-OpenAI 2025 年推出的 [Responses API](https://developers.openai.com/api/docs/guides/conversation-state) 也在解决"重复发送前缀"的问题,但思路不同。两者可结合使用。
+哈希用 blake2b 而非 `hash()`：Borg 明确要求块 id 必须是密码学强哈希，
+且内置 `hash()` 带进程随机盐，不能跨进程复用缓存。
 
-### 思路差异
+## 存储
 
-| | OpenAI Responses API | Tail |
-|---|---|---|
-| **缓存位置** | OpenAI **服务端**存储(`store=true`) | **网关 + 客户端**侧(你自己的基础设施) |
-| **复用机制** | `previous_response_id` 链式引用上一次响应 | `X-Cache-Hash` 协商 + 增量 messages |
-| **绑定厂商** | **仅 OpenAI**(响应对象存在 OpenAI 侧) | **厂商无关**(任何 OpenAI 兼容 API:DeepSeek/Qwen/本地 vLLM 等) |
-| **换模型** | ❌ 换模型会断链(上一轮响应不可用于其他模型) | ✅ 无影响(缓存按 model 维度隔离) |
-| **数据所有权** | OpenAI 持有 30 天([官方策略](https://developers.openai.com/api/docs/guides/your-data)) | **完全自控**(可立即删除、私有部署) |
-| **计费** | 即使 `previous_response_id`,链上**所有历史 input token 仍按 input 计费** | 后端收到的就是完整请求,计费不变 |
-| **协议兼容** | Responses API(新协议,需改代码迁移) | Chat Completions(**零改动**) |
+扁平块集合，**没有链、没有 prev 指针、没有引用图**。顺序由请求里的帧序列直接表达，
+所以不需要引用计数、不需要访问驱动续期、不需要缺块补发协议、不存在「部分命中」概念。
 
-### 什么时候用哪个?
+```
+blk:{block_hash} → 块内容
+```
 
-- **只用 OpenAI、且能接受 30 天服务端存储** → Responses API 够用,无需 Tail
-- **用 DeepSeek / Qwen / 本地 vLLM / 多厂商** → Tail(Responses API 不支持非 OpenAI)
-- **数据合规要求自控(金融/医疗/政企)** → Tail(缓存在你自己的网关,不进第三方)
-- **想省的是"上行流量"而非"token 计费"** → Tail 直接生效;Responses API 的省流量效果类似,但依赖服务端实现
-- **两者可叠加**:用 Tail 省上行流量,同时后端是 OpenAI 时也可用 Responses API
-
-### 本质区别
-
-Responses API 是"**把状态交给厂商保管**"——换取便捷,但锁定厂商、数据留存厂商侧。
-Tail 是"**状态自己管**"——多写一层网关,换来自控、跨厂商、协议兼容。
-
----
-
-## 关键设计
-
-1. **v2.1 Segment-Merkle**:messages 按 LLM 回合切 segment,三段独立 hash(system/tools/messages),组合 `cache_key = sys::tools::pfx`;加一段只增 O(1) 节点;跨对话内容寻址复用。
-2. **访问驱动续期**:缓存节点读一次续一个 TTL,活跃对话链永不过期,沉寂对话自然消亡。
-3. **Storage 抽象**:对齐 7 方法接口,默认 `DbmStorage`(标准库 dbm,零依赖),可插拔 Redis 等。
-4. **SDK 一致性**:前缀指纹校验(防 compact/编辑/重排静默错误)+ 多 session 上下文隔离 + 自动降级全量重发。
-5. **透明 streaming**:SSE 边收边发,不缓冲,`text/event-stream` 原样透传。
-6. **乐观发送 + fast_fail**:默认带 hash,未命中返回 412 由 SDK 重试一次(零额外 RTT)。
-
-详见 `docs/DESIGN-chunked-cache.md`。
-
----
+- `MemoryStorage` —— 进程内，重启即丢（默认）
+- `DbmStorage` —— 零依赖，单机部署
+- `RedisStorage` —— MGET 批量取块，生产用（`pip install redis`）
 
 ## 测试
 
 ```bash
-# Python 网关单测 + 端到端(含 streaming SSE)
-python3 -m pytest tests/test_gateway_py.py -v
-
-# openai patch 单测(纯 Python)
-python3 -m pytest tests/test_openai_patch.py -v
+python -m pytest tests/ -v
 ```
 
-| 层 | 数量 | 覆盖 |
-|----|------|------|
-| Python 网关 | 27 | 算法一致性 / dbm roundtrip / ASGI 端到端 / **streaming SSE 透传** / 缓存命中 |
-| openai patch | 18 | 多轮增量 / 多模型 / compact 降级 / 多 session 隔离 / 重试 |
-| OpenResty 端到端 | 15 | 三段存储 / 命中还原 / reload 持久 / 访问驱动续期 / streaming |
+85 个测试，覆盖分块与前缀复用、帧格式往返、渲染确定性、编解码、存储后端、
+「客户端 → ASGI 网关 → mock 上游」的端到端链路（含存储失效降级与恢复），
+以及用真实 `openai` SDK 经 `TailTransport` 接入的回归测试。
 
----
+## 目录
 
-## 两个网关实现(可互换)
+```
+tail/
+├── __init__.py
+├── serve.py              # ASGI 网关服务 + CLI（python -m tail.serve）
+└── transport/
+    ├── render.py         # 渲染器 / 反渲染器（唯一懂 LLM 语义的地方）
+    ├── codec.py          # 编码器 / 解码器（只认字节）
+    ├── chunking.py       # 定长分块 + block_hash
+    ├── frames.py         # 帧格式
+    ├── storage.py        # 块存储后端
+    ├── gateway.py        # 串成请求路径（TailClient / TailGateway）
+    └── client.py         # 客户端接入：TailTransport（给 openai SDK 用）
+examples/
+├── chat.py               # 原生 openai 流式对话
+└── chat_tail.py          # 同一份代码接入 Tail（diff 仅 3 行）
+tests/
+├── test_transport.py     # 单元 + 集成
+├── test_e2e.py           # 端到端（真 ASGI + mock 上游）
+├── test_client_transport.py  # TailTransport / 真实 openai SDK
+└── mock_backend.py       # 模拟上游推理服务
+docs/
+└── TRANSPORT-PIPELINE.md           # 协议、数据管线与设计动机
+```
 
-| | Python 版(主) | OpenResty 版(可选) |
-|---|---|---|
-| 框架 | FastAPI + uvicorn | OpenResty + Lua |
-| 存储 | dbm(零依赖默认)/ Redis 等 | Kvrocks(硬盘) |
-| 启动 | `python -m tail.gateway --backend URL` | `./run.sh start`(需编译 OpenResty+Kvrocks) |
-| cache_key | **逐字节一致** | **逐字节一致** |
+## 已知风险（合并前请知悉）
 
-两者产出的 `X-Cache-Hash` 完全相同(同样的 messages → 同样的 `sys::tools::pfx`),可互换或共存。Python 版零依赖开箱即用;OpenResty 版性能更高(适合大流量生产)。
+**网关当前不校验客户端声称的块哈希。** 解码器直接把新块帧里的 `block_hash` 当
+存储键写入（[codec.py](tail/transport/codec.py) 不维护父链、不重算）。因此一个
+有 bug 或恶意的客户端可以声称「哈希 X 的内容是 Y」，污染全局块存储——之后**任何**
+引用 X 的请求都会解出 Y，造成跨用户静默内容损坏。
 
----
+修法不需要改线缆格式：解码器顺次解码时本来就知道前一块的哈希，可维护父链并校验
+`block_hash(content, parent)` 是否等于帧里声称的值。**这是上生产前必须补的一条。**
 
-## License
+其余两条健壮性缺口：
 
-MIT
+- `BLOCK_SIZE` 没有纳入哈希、也不协商。两端常量不一致时不会报错，只会静默解出错误内容。
+- 没有初始同步：客户端重启后 `known` 集合清空，即使对端数据都在也要全量重发一次。
+
+## 未做的部分
+
+- ❌ Anthropic Messages / OpenAI Responses API 转换（留给新的 renderer）
+- ❌ 直接对接推理引擎的 token / KV cache 接口
+- ❌ 跨模型族的中间格式（harmony 等）
+- ❌ 客户端 `known` 集合的持久化（目前进程内，重启后退化为冷启动）
+- ❌ 网关侧的块哈希校验（缺父链，见「已知风险」）
+- ❌ `BLOCK_SIZE` 纳入哈希 / 协商
+- ❌ 对接真实 LLM 上游验证（目前只有 mock backend 与自环往返测试）
+- ❌ 下行（模型输出）方向的字节优化，目前只优化了上行请求

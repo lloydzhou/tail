@@ -36,8 +36,20 @@ def build_backend_app() -> FastAPI:
 
     @app.post("/v1/chat/completions")
     async def completions(request: Request):
+        # 手动迭代 body 片段,记录「第一片到达」与「收完」的时刻。
+        # 这是验证网关是否「边收边转发」的观测点:若网关先收齐整个请求体
+        # 再转发,两者会几乎同时发生。
+        app.state.first_chunk_at = None
+        app.state.body_done_at = None
+        raw = bytearray()
+        async for chunk in request.stream():
+            if chunk:
+                if app.state.first_chunk_at is None:
+                    app.state.first_chunk_at = time.monotonic()
+                raw += chunk
+        app.state.body_done_at = time.monotonic()
         try:
-            body = await request.json()
+            body = json.loads(bytes(raw))
         except Exception:
             body = {}
         messages = body.get("messages", []) or []

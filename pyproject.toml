@@ -1,34 +1,36 @@
 [project]
 name = "tail"
-version = "2.1.0"
-description = "Tail — Send the tail, the head is cached. 传输层 KV Cache 优化:openai SDK monkey patch + OpenResty/Kvrocks 网关,透明节省 LLM 上行带宽。"
+version = "3.0.0"
+description = "Tail —— 在 LLM SDK 与上游推理服务之间插入的文本去重传输层。把重复上下文换成块引用，显著压缩公网上行体积。"
 readme = "README.md"
 requires-python = ">=3.10"
 authors = [{ name = "lloydzhou" }]
 license = { text = "MIT" }
 dependencies = [
-    "openai>=1.0",
+    "httpx2>=2.12",
     "fastapi>=0.110",
     "uvicorn>=0.27",
-    "httpx>=0.27",
 ]
 
 [project.optional-dependencies]
+redis = ["redis>=5.0"]
 test = [
     "pytest>=8.0",
     "pytest-asyncio>=0.23",
-    "httpx>=0.27",
+    "httpx2>=2.12",
     "fastapi>=0.110",
     "uvicorn>=0.27",
-    "redis>=5.0",
 ]
+
+[project.scripts]
+tail-gateway = "tail.serve:main"
 
 [build-system]
 requires = ["setuptools>=68"]
 build-backend = "setuptools.build_meta"
 
 [tool.setuptools]
-packages = ["tail"]
+packages = ["tail", "tail.transport"]
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
