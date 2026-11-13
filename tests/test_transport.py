@@ -1,9 +1,9 @@
 """transport 层测试:分块、帧格式、渲染、编解码、存储、网关。
 
-新协议要点(与 v1 的差异,详见 docs/PROTOCOL-v2.md):
+协议要点(详见 docs/TRANSPORT-PIPELINE.md):
   - 渲染器 / 反渲染器 / 编码器 / 解码器 **全部是流式的**
-  - Content-Type 改为 application/x-tail-v2
-  - 流式切块必须与一次性切分产生完全相同的块边界(缓存正确性的基础)
+  - Content-Type 为 application/x-tail-v2
+  - 分块用 vLLM 式定长块 + 哈希链,流式切块必须与一次性结果完全一致
 """
 
 from __future__ import annotations
