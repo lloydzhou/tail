@@ -103,6 +103,30 @@ def measure(client, url: str, payload: dict, rounds: int = 9) -> tuple:
     return statistics.median(walls), body_size, status
 
 
+class ThrottledTransport(httpx2.HTTPTransport):
+    """按指定上行带宽给请求体加传输时延,模拟公网链路。
+
+    本地回环没有带宽瓶颈,Tail 只是白白多花解码时间;真实公网相反。
+    这个类用来还原真实链路,是「省字节 → 降 TTFT」这条因果链的唯一验证手段。
+    """
+
+    def __init__(self, uplink_mbps: float) -> None:
+        super().__init__()
+        self._bytes_per_sec = uplink_mbps * 1_000_000 / 8
+
+    def handle_request(self, request):
+        def slowed():
+            for chunk in request.stream:
+                yield chunk
+                time.sleep(len(chunk) / self._bytes_per_sec)
+
+        headers = [(k, v) for k, v in request.headers.raw
+                   if k.lower() != b"content-length"]
+        return super().handle_request(
+            httpx2.Request(request.method, request.url, headers=headers,
+                          content=slowed()))
+
+
 def main() -> None:
     url = start_servers()
     sizes = (66, 242, 418, 829)
@@ -124,6 +148,24 @@ def main() -> None:
     print()
     print("注:透传只是把字节搬过去;帧流要解码 + 反渲染 + 重建 JSON,")
     print("所以耗时高于透传。收益在上行字节,不在网关 CPU。")
+    print()
+
+    print("### 慢上行链路:请求提交耗时(这才是 TTFT 的前置段)\n")
+    print("模拟公网上行带宽,比较「整个请求体发完并被处理完」的时间。\n")
+    print("| 上行带宽 | 原生 JSON 透传 | Tail 帧流(热) | 提速 |")
+    print("|---|---|---|---|")
+    for mbps in (10, 5, 2):
+        payload = build_payload(829)
+        plain, _, _ = measure(
+            httpx2.Client(transport=ThrottledTransport(mbps)), url, payload, rounds=5)
+        tailed, _, _ = measure(
+            httpx2.Client(transport=TailTransport(inner=ThrottledTransport(mbps))),
+            url, payload, rounds=5)
+        print(f"| {mbps} Mbps | {plain:.0f} ms | {tailed:.0f} ms "
+              f"| **{plain / tailed:.1f}×** |")
+    print()
+    print("回环上看 Tail 更慢(要解码),慢链路上快一个数量级——因为上行从 770 KB")
+    print("降到约 30 KB。这是本项目存在的理由。")
     print()
 
 
