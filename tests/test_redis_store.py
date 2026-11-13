@@ -64,8 +64,8 @@ class TestRedisChainStore:
         got = store.get_many(ids)
         assert b"".join(got[bid] for bid in ids) == want
 
-    def test_root_block_content_is_not_truncated(self, store):
-        """回归:根块父哈希为空,value 曾是 ``"" ‖ content``,读回来被切掉 32 字节。"""
+    def test_root_block_content_is_exact(self, store):
+        """根块的正文必须原样存、原样取(链与正文分开后不再有截断风险,留作回归)。"""
         first = b"x" * 64
         rest = b"y" * 64
         items = storage.text_blocks(first + rest, 64)
@@ -76,8 +76,21 @@ class TestRedisChainStore:
     def test_missing_middle_block_is_incomplete(self, store, client):
         items, _ = _chain("b" * 400, 64)
         tip = store.put_chain(b"", items)
-        client.delete(store._key(items[1][0]))
+        client.delete(store._pkey(items[1][0]))
         assert store.resolve(tip, len(items)) is None
+
+    def test_missing_body_is_a_miss_but_chain_still_walks(self, store, client):
+        """正文和链分开存:正文缺一块时走链仍成功,由上层判 miss(409 重发)。
+
+        这也是两个命名空间的意义——链只依赖 ``p:``,不会因为正文被判 dead 就散架。
+        """
+        items, _ = _chain("m" * 300, 64)
+        tip = store.put_chain(b"", items)
+        client.delete(store._bkey(items[2][0]))
+        assert store.resolve(tip, len(items)) == [bid for bid, _ in items]
+        got = store.get_many([bid for bid, _ in items])
+        assert items[2][0] not in got
+        assert len(got) == len(items) - 1
 
     def test_partial_length(self, store):
         items, _ = _chain("c" * 400, 64)
@@ -96,7 +109,9 @@ class TestRedisChainStore:
         time.sleep(1.2)
         # 若没续期,第 0 块这时已经过期(2.7s > 2s)
         assert st.resolve(tip, len(items)) is not None
-        assert client.ttl(st._key(items[0][0])) > 0
+        # 链和正文两把 key 的 TTL 必须一起续,不能只续链
+        assert client.ttl(st._pkey(items[0][0])) > 0
+        assert client.ttl(st._bkey(items[0][0])) > 0
 
     def test_expired_chain_reads_as_miss(self, client):
         st = storage.RedisChainStore(client, ttl=1, namespace="tailtest-exp")
@@ -121,11 +136,11 @@ class TestFullPathOnRedis:
         assert roundtrip(payload, store, client) == payload
         # 第二轮全命中:客户端只发不足一块的尾巴
         before = sum(1 for _ in store._client.scan_iter(
-            match=store._ns + storage.KEY_PREFIX + "*"))
+            match=store._ns + storage.KEY_BLOCK + "*"))
         back = roundtrip(payload, store, client)
         assert back == payload
         after = sum(1 for _ in store._client.scan_iter(
-            match=store._ns + storage.KEY_PREFIX + "*"))
+            match=store._ns + storage.KEY_BLOCK + "*"))
         assert after == before, "同样的内容不该再写块"
 
     def test_have_roundtrip_through_url_factory(self, client):

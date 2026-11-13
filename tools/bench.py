@@ -467,57 +467,41 @@ def bench_redis() -> None:
     if client is None:
         return
     store = storage.RedisChainStore(client, ttl=1800, namespace="tailbench")
-    store.clear()
 
     payload = build_big(829)
     text = _rendered(payload)
-    blocks = text[:len(text) // BLOCK * BLOCK]
-    items = []
-    parent = b""
-    hasher = chunking.BlockHasher(BLOCK)
-    for bid, block in hasher.feed(blocks):
-        items.append((bid, block))
-        parent = bid
-    tip = parent
-    n = len(items)
 
-    # 先写一遍,后面才有链可走
-    store.put_chain(b"", items)
-    t_put = _best_wall(lambda: store.put_chain(b"", items))
-    t_resolve = _best_wall(lambda: store.resolve(tip, n))
-    t_get = _best_wall(lambda: store.get_many([bid for bid, _ in items]))
-    t_both = _best_wall(lambda: store.get_many(store.resolve(tip, n) or []))
-
-    # 上面 put 已经写过一遍,resolve 才有东西可走;顺序上先 put 再测
-    print("### Redis:一条 829 KB 前缀(整条链)的成本")
+    print("### Redis:一条 829 KB 前缀(链与正文分开)")
     print()
-    print(f"块数 **{n}**,每个 value = 父哈希 hex(32 B) + 正文(≤{BLOCK} B)。")
+    print("``p:{hash}`` 只存父哈希(32 B),``b:{hash}`` 只存正文;读 = 走链脚本(一次往返)"
+          "+ MGET(一次往返)。")
     print()
-    print("| 操作 | 往返次数 | 单次耗时(wall) | 说明 |")
-    print("|---|---|---|---|")
-    print(f"| 写整条链(单脚本,{n} 块) | 1 | {t_put * 1e3:.2f} ms | 原子:要么整条可见,要么全不可见 |")
-    print(f"| 走链 {n} 跳(单脚本) | 1 | {t_resolve * 1e3:.2f} ms | 顺带把整条前缀续到 TTL |")
-    print(f"| MGET {n} 块 | 1 | {t_get * 1e3:.2f} ms | 取正文 |")
-    print(f"| **读整条前缀** | **2** | **{t_both * 1e3:.2f} ms** | 热请求每轮的存储成本 |")
+    print("| 块大小 | 块数 | 写整条(2 key/块) | 走链 | MGET | **读一次** | 单实例上限 |")
+    print("|---|---|---|---|---|---|---|")
+    for bs in (512, 2048, 4096):
+        store.clear()
+        body = text[: len(text) // bs * bs]
+        items = list(chunking.BlockHasher(bs).feed(body))
+        tip = items[-1][0]
+        n = len(items)
+        store.put_chain(b"", items)
+        t_put = _best_wall(lambda: store.put_chain(b"", items))
+        t_walk = _best_wall(lambda: store.resolve(tip, n))
+        t_get = _best_wall(lambda: store.get_many([bid for bid, _ in items]))
+        t_all = _best_wall(lambda: store.get_many(store.resolve(tip, n) or []))
+        print(f"| {bs} B | {n} | {t_put * 1e3:.2f} ms | {t_walk * 1e3:.2f} ms | "
+              f"{t_get * 1e3:.2f} ms | **{t_all * 1e3:.2f} ms** | "
+              f"**{1 / t_all:,.0f} req/s** |")
     print()
-    ceiling = 1 / t_both
-    print(f"单个 Redis 实例的上限约 **{ceiling:,.0f} req/s**:只读、每条请求都走完整条 "
-          f"829 KB 前缀,不计网络其余开销。")
+    print("走链是 O(块数):每块一次 ``GETEX``(读父哈希 + 续链 TTL)加一次 ``EXPIRE``")
+    print("(续正文 TTL)。所以**块大小决定单实例上限**——3,333 req/s 按会话键分片,")
+    print("512 B 块要几十个实例,4 KB 块几个就够。")
     print()
-    print("这个值由「每请求从 Redis 搬走 829 KB + 1,774 跳」决定,与 Lua 无关。")
-    print(f"按 3,333 req/s(10 万在线 / 30 s 一轮)算,单实例差 {3333 / ceiling:.0f} 倍;")
-    print("只能靠分片(按会话键,线性)或更长的块(跳数降、每轮尾块上限变大)。")
-    print()
-
-    # Lua 脚本自身的固定开销:块数少的时候是常数
     print("| 块数 | 走链耗时 |")
     print("|---|---|")
-    for k in (1, 8, 64, 256, 512, n):
+    for k in (1, 8, 64, 256, 512, len(items)):
         tt = _best_wall(lambda: store.resolve(tip, k), samples=5)
         print(f"| {k} | {tt * 1e3:.3f} ms |")
-    print()
-    print("走链是 O(块数),每块一次 GET + 一次 EXPIRE。瓶颈是「每请求 1,774 跳顺序读」")
-    print("加「829 KB 出 Redis」这两项,不是 Lua 的固定开销。")
     store.clear()
 
 
