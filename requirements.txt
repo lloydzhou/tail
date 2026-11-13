@@ -1,10 +1,11 @@
-# 运行时(客户端 patch)
-openai>=1.0
-
-# 测试(e2e 需先起 OpenResty + Kvrocks + mock backend)
-pytest>=8.0
-pytest-asyncio>=0.23
-httpx>=0.27
+# 运行时(网关服务)
 fastapi>=0.110
 uvicorn>=0.27
-redis>=5.0
+httpx>=0.27
+
+# 可选:Redis 块存储后端
+# redis>=5.0
+
+# 测试
+pytest>=8.0
+pytest-asyncio>=0.23
