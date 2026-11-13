@@ -1,38 +1,34 @@
-"""块存储:链与正文分开放。
+"""块存储:一块一个 key,value = 父哈希 ‖ 正文。
 
-两个命名空间,都是纯 STRING:
-
-    p:{block_hash_hex} → parent_hex(32 ASCII)     只有父哈希,不掺正文
-    b:{block_hash_hex} → content(≤块大小)         只有正文
+    blk:{block_hash_hex} → parent_hex(32 ASCII) ‖ content(≤块大小)
 
 因为 ``block_hash = blake2b(parent_hash ‖ block)[:16]``,「链尾摘要」等价于
 「整条前缀的入口」:给定 tip 和前缀块数,可以从后往前走回第一块。
 
-**为什么分开**(v4 相对 v3 的改动):v3 把父哈希和正文拼在同一个 value 里,走链时
-每一步都要把 544 B 的 value 搬进 Lua,而走链只需要 16 B 的父哈希——一块 829 KB
-前缀就是白白多搬 887 KB。分开之后走链只搬 16 B/跳,正文由一条 MGET 批量取回,
-按顺序拼接(拼接本身 <0.05 ms,从来不是瓶颈)。
+与 vLLM 的关系:vLLM 的 ``block_hash = hash(parent_hash, block)`` 一模一样;
+差异只在链放在哪——vLLM 的推理进程手里有完整 token 序列,可以从第 0 块**正向
+重算**整条哈希再逐个查表,所以它的索引只有 ``hash → block_id`` 一张字典,不需要
+父指针。网关按定义拿不到前缀(只收 ``(L, tip)`` + 尾部),只能从 tip **反向**走,
+父指针就必须真的存下来:那 32 B/块是「看不到全文」这个前提的代价,不是冗余。
 
-两种 key 分开以后 TTL 必须**一起**续:走链时对 ``p:`` 用 ``GETEX``(读+续期一条命令),
-对 ``b:`` 在同一脚本里补一次 ``EXPIRE``;写的时候两组 key 在同一个脚本里用同一个 TTL
-写入。两把 key 的 TTL 因此永远同步,不存在「链还在、正文先死」的中间态;真出现某块
-缺失(淘汰/清空),``resolve`` 返回 None ⇒ 网关回 409 让客户端重发,不会拼出错前缀。
+**为什么读只有一次往返**:``read_prefix`` 用一个 Lua 脚本走完 N 跳,把整条前缀的
+value 一次带回。正文里的 32 字节父哈希在 **Python 侧**用 ``memoryview`` 切掉——
+零拷贝,只挪指针;真正的一次拷贝发生在最后 ``b"".join``。早先在 Lua 里
+``string.sub(v, 33)`` 切,那是每块一次真实拷贝:1,774 块时慢 16%,4 KB 块时慢 30%
+(块越大越亏),所以脚本只负责走链,不碰正文。
 
-API(所有后端一致)
-------------------
-    put_chain(parent, [(block_hash, content), ...]) -> 新的链尾
-    resolve(tip, n_blocks)  -> 从前到后的 block_hash 列表,或 None(前缀不完整)
-    get_many([block_hash, ...]) -> {block_hash: content}
+**注意返回顺序**:脚本按走链方向返回,**链尾在前、链头在后**。``read_prefix``
+在 Python 侧倒过来,对外保证「从前到后」;实现细节别改成「按走链顺序返回」,
+上层直接喂解析器,顺序反了不会报错,只会把上下文拼反。
 
 读写都用 Lua,保证原子性:
 
-  - **写**:`put_chain` 用一个脚本一次写完整串(两块 key + 同一个 TTL)。否则网关在
-    只写了一半时就把新 tip 告诉客户端,对端拿到的是一个悬挂的链——读的时候
-    `resolve` 返回 None,表现为「刚发过的前缀立刻 miss」。脚本原子,要么整串可见,
-    要么全不可见。
-  - **读**:`resolve` 用一个脚本完成「递归走链 + 批量续期」,一次往返。
-  - `get_many` 是单条 MGET,本身原子;它与 `resolve` 之间隔了一次往返,
-    期间若有块过期,表现为该前缀 miss(安全地退化成全量重发),不会拼出错前缀。
+  - **写**:`put_chain` 用一个脚本一次写完整串(连同 TTL)。否则网关在只写了一半
+    时就把新 tip 告诉客户端,对端拿到的是一个悬挂的链——读的时候
+    `read_prefix` 返回 None,表现为「刚发过的前缀立刻 miss」。脚本原子,要么整串
+    可见,要么全不可见。
+  - **读**:`read_prefix` 用一个脚本完成「走链 + 逐块续期」。per-block TTL 下,
+    读和续期必须是同一件事,否则出现「读到一半某块过期」的中间态。
 
 **递归必须在脚本里做**:每跳都依赖上一跳的结果,由网关逐跳发命令就是 N 次网络往返。
 """
@@ -40,16 +36,21 @@ API(所有后端一致)
 from __future__ import annotations
 
 from collections import OrderedDict
-from typing import Dict, List, Optional, Sequence, Tuple
+from typing import List, Optional, Sequence, Tuple, Union
 
-#: 正文 key 前缀
-KEY_BLOCK = "b:"
+#: 块 key 前缀
+KEY_BLOCK = "blk:"
 
-#: 父链 key 前缀
-KEY_PARENT = "p:"
+#: parent 在 value 里的编码长度(16 字节哈希的 hex)
+_PARENT_HEX = 32
 
-#: 链根的父哈希(hex 后是 32 个 "0")。定长,走链脚本才能直接拿 value 当下一跳。
+#: 链根的父哈希。必须**定长**:value 是 ``parent_hex(32) ‖ content``,
+#: 早先把根写成空串,读回来时 ``v[32:]`` 会吃掉根块正文的前 32 字节。
 _ZERO_PARENT = b"\x00" * 16
+
+#: 一块正文。Redis 后端返回 ``memoryview``(零拷贝切掉父哈希),内存后端就是
+#: ``bytes``;两者都支持 len/迭代/拼接,上层按 bytes 用即可。
+BlockContent = Union[bytes, memoryview]
 
 
 def _encode_parent(parent: bytes) -> bytes:
@@ -64,15 +65,13 @@ class ChainStore:
         """按顺序写入一串块,第一块的父哈希是 ``parent``。返回新的链尾。"""
         raise NotImplementedError
 
-    def resolve(self, tip: bytes, n_blocks: int) -> Optional[List[bytes]]:
-        """从链尾走 ``n_blocks`` 步,返回**从前到后**的 block_hash 列表。
+    def read_prefix(self, tip: bytes,
+                    n_blocks: int) -> Optional[List[BlockContent]]:
+        """从链尾走 ``n_blocks`` 步,返回**从前到后**的正文列表。
 
-        前缀不完整(中间有块被淘汰/清空)时返回 ``None``。
+        每项已切掉 value 里的父哈希前缀。前缀不完整(中间有块被淘汰/清空/
+        过期)时返回 ``None``——上层据此回 409 让客户端重发,绝不拼出带洞的前缀。
         """
-        raise NotImplementedError
-
-    def get_many(self, ids: Sequence[bytes]) -> Dict[bytes, bytes]:
-        """批量取块内容。缺失的 id 不出现在结果里。"""
         raise NotImplementedError
 
     def clear(self) -> None:
@@ -103,27 +102,20 @@ class MemoryChainStore(ChainStore):
                 self._data.popitem(last=False)
         return tip
 
-    def resolve(self, tip: bytes, n_blocks: int) -> Optional[List[bytes]]:
+    def read_prefix(self, tip: bytes,
+                    n_blocks: int) -> Optional[List[BlockContent]]:
         if n_blocks <= 0:
             return []
-        out: List[bytes] = []
+        out: List[BlockContent] = []
         cur = tip
         for _ in range(n_blocks):
             item = self._data.get(cur)
             if item is None:
                 return None
-            out.append(cur)
+            self._data.move_to_end(cur)
+            out.append(item[1])
             cur = item[0]
         out.reverse()
-        return out
-
-    def get_many(self, ids: Sequence[bytes]) -> Dict[bytes, bytes]:
-        out: Dict[bytes, bytes] = {}
-        for bid in ids:
-            item = self._data.get(bid)
-            if item is not None:
-                out[bid] = item[1]
-                self._data.move_to_end(bid)
         return out
 
     def clear(self) -> None:
@@ -137,53 +129,39 @@ class MemoryChainStore(ChainStore):
 # Redis
 # ---------------------------------------------------------------------------
 
-#: 原子写入整串:正文 key 与父链 key 用同一个 TTL 一次写完。
-#: KEYS      = [b:key_1..b:key_n, p:key_1..p:key_n]
-#: ARGV[1]   = TTL 秒
-#: ARGV[2..n+1]        = 正文(value)
-#: ARGV[n+2..2n+1]     = 父哈希 hex(32 ASCII)
-_PUT_LUA = """
-local n = #KEYS / 2
+#: 原子写入整串块。KEYS = 完整 key 列表,ARGV[1] = TTL 秒,ARGV[2..] = value。
+#: 一次脚本内写完,保证「链要么整串可见,要么全不可见」。
+_PUT_CHAIN_LUA = """
 local ttl = tonumber(ARGV[1])
-for i = 1, n do
+for i = 1, #KEYS do
   if ttl > 0 then
     redis.call('SET', KEYS[i], ARGV[i + 1], 'EX', ttl)
-    redis.call('SET', KEYS[n + i], ARGV[n + 1 + i], 'EX', ttl)
   else
     redis.call('SET', KEYS[i], ARGV[i + 1])
-    redis.call('SET', KEYS[n + i], ARGV[n + 1 + i])
   end
 end
-return n
+return #KEYS
 """
 
-#: 递归走链 + 批量续期,一次往返、原子。
-#: KEYS[1] = "p:" 前缀,KEYS[2] = "b:" 前缀
-#: ARGV[1] = tip hex,ARGV[2] = 块数,ARGV[3] = TTL 秒
-#: 返回从链尾到链头的 hex 列表;前缀不完整返回空表。
+#: 走链 + 逐块续期,一次往返、原子。返回 value 原样(父哈希 + 正文)。
+#: KEYS[1] = "blk:" 前缀,ARGV[1] = tip hex,ARGV[2] = 块数,ARGV[3] = TTL 秒
+#: 返回从链尾到链头的 value 列表;任何一跳缺失返回空表(上层判 miss)。
 #:
-#: ``GETEX`` 读父链的同时把 ``p:`` 续到 TTL(一条命令,不额外花一次调用);
-#: ``b:`` 没有 MGETEX,所以同一脚本里补一次 ``EXPIRE``——两条 key 的 TTL 因此始终
-#: 一起走,不会出现「链还在、正文先过期」的中间态。
-_WALK_LUA = """
-local pk = KEYS[1]
-local bk = KEYS[2]
+#: 脚本**不切正文**:切是每块一次真实拷贝,交给 Python 侧 memoryview 零拷贝切。
+#: 它只负责走链,``string.sub(v, 1, 32)`` 取的是下一跳的 key,不是正文。
+_RESOLVE_LUA = """
+local prefix = KEYS[1]
 local cur = ARGV[1]
 local n = tonumber(ARGV[2])
 local ttl = tonumber(ARGV[3])
 local out = {}
 for i = 1, n do
-  local pkey = pk .. cur
-  local v
-  if ttl > 0 then
-    v = redis.call('GETEX', pkey, 'EX', ttl)
-  else
-    v = redis.call('GET', pkey)
-  end
+  local k = prefix .. cur
+  local v = redis.call('GET', k)
   if not v then return {} end
-  if ttl > 0 then redis.call('EXPIRE', bk .. cur, ttl) end
-  out[#out + 1] = cur
-  cur = v
+  if ttl > 0 then redis.call('EXPIRE', k, ttl) end
+  out[#out + 1] = v
+  cur = string.sub(v, 1, 32)
 end
 return out
 """
@@ -192,12 +170,8 @@ return out
 class RedisChainStore(ChainStore):
     """Redis 链式存储(生产唯一后端)。
 
-    两个命名空间各一个 key:``p:{hash}`` 只存父哈希(32 B hex),``b:{hash}``
-    只存正文。走链只搬 16 字节/跳,正文一条 MGET 批量取回。
-
-    所有 key 用 hex 而不是裸 16 字节:脚本里可以直接 ``string.sub``/拼接,
-    读回来的 id 也能直接当 key 用,省两轮编解码;代价是每块多 32 B 的 key 与
-    value 长度,相对正文可以忽略。
+    value = parent_hex(32 B) ‖ content。用 hex 而不是裸 16 字节,省在 Lua 里少一次
+    编解码;代价是每块多 16 B(约 3%),换来的是脚本能直接用 ``string.sub`` 走链。
     """
 
     def __init__(self, client, ttl: Optional[int] = None,
@@ -205,83 +179,71 @@ class RedisChainStore(ChainStore):
         """
         Args:
           client: ``redis.Redis`` 同步客户端
-          ttl: key 的过期秒数;``resolve`` 读的时候会把链和正文一起续到这个值
+          ttl: 每块的过期秒数;``read_prefix`` 时会顺带把整条前缀续到这个值
           namespace: key 前缀,便于多环境隔离
         """
         self._client = client
         self._ttl = int(ttl or 0)
         self._ns = namespace + ":"
-        self._walk = client.register_script(_WALK_LUA)
-        self._put_chain = client.register_script(_PUT_LUA)
+        self._resolve = client.register_script(_RESOLVE_LUA)
+        self._put_chain = client.register_script(_PUT_CHAIN_LUA)
 
     # -- key ---------------------------------------------------------------
-    def _bkey(self, bid: bytes) -> str:
+    def _key(self, bid: bytes) -> str:
         return self._ns + KEY_BLOCK + bid.hex()
-
-    def _pkey(self, bid: bytes) -> str:
-        return self._ns + KEY_PARENT + bid.hex()
 
     # -- 写 ---------------------------------------------------------------
     def put_chain(self, parent: bytes,
                   items: Sequence[Tuple[bytes, bytes]]) -> bytes:
-        """用**一个 Lua 脚本**原子写入整串:正文 + 父链 + 同一个 TTL。
+        """用**一个 Lua 脚本**原子写入整串块(一块一个 key,同一个 TTL)。
 
         不能用 pipeline:非事务管线只保证「按顺序发」,中途出错(或进程被杀)会留下
         半条链——而网关随后会把那段前缀的 tip 告诉客户端,对端下一次拿着一个
-        悬挂的 tip 来,`resolve` 返回 None,表现为「刚发过的内容立刻 miss」。
+        悬挂的 tip 来,`read_prefix` 返回 None,表现为「刚发过的内容立刻 miss」。
         脚本内写完才返回,链要么整串可见,要么全不可见。
 
         块数很多时调用方要自己分批(每批几百块),避免脚本长时间占住实例。
         """
         if not items:
             return parent
-        bkeys: List[str] = []
-        pkeys: List[str] = []
-        contents: List[bytes] = []
-        parents: List[bytes] = []
+        keys: List[str] = []
+        values: List[bytes] = []
         tip = parent
         for bid, content in items:
-            bkeys.append(self._bkey(bid))
-            pkeys.append(self._pkey(bid))
-            contents.append(content)
-            parents.append(_encode_parent(tip))
+            keys.append(self._key(bid))
+            values.append(_encode_parent(tip) + content)
             tip = bid
-        self._put_chain(keys=[*bkeys, *pkeys],
-                        args=[self._ttl, *contents, *parents])
+        self._put_chain(keys=keys, args=[self._ttl, *values])
         return tip
 
     # -- 读 ---------------------------------------------------------------
-    def resolve(self, tip: bytes, n_blocks: int) -> Optional[List[bytes]]:
-        """递归走链:一个 Lua 脚本、一次往返,链和正文的 TTL 一起续。"""
+    def read_prefix(self, tip: bytes,
+                    n_blocks: int) -> Optional[List[BlockContent]]:
+        """走链:一个 Lua 脚本、一次往返,整条前缀的正文一起带回来。
+
+        返回的每项是 ``memoryview``:从 value 的 byte 33 开始,父哈希没有拷贝、
+        正文也没有拷贝,只切了一层视图。
+        """
         if n_blocks <= 0:
             return []
-        raw = self._walk(keys=[self._ns + KEY_PARENT, self._ns + KEY_BLOCK],
-                         args=[tip.hex(), n_blocks, self._ttl])
+        raw = self._resolve(keys=[self._ns + KEY_BLOCK],
+                            args=[tip.hex(), n_blocks, self._ttl])
         if not raw or len(raw) != n_blocks:
             return None
-        out = [bytes.fromhex(i.decode() if isinstance(i, bytes) else i)
-               for i in raw]
-        out.reverse()
-        return out
-
-    def get_many(self, ids: Sequence[bytes]) -> Dict[bytes, bytes]:
-        if not ids:
-            return {}
-        values = self._client.mget([self._bkey(bid) for bid in ids])
-        return {bid: bytes(v) for bid, v in zip(ids, values) if v is not None}
+        # 脚本按走链方向返回(链尾在前),对外倒成「从前到后」。
+        return [memoryview(v)[_PARENT_HEX:] for v in reversed(raw)]
 
     def clear(self) -> None:
-        # 只删本命名空间下的 key:SCAN 而不是 KEYS,避免阻塞
-        for prefix in (KEY_BLOCK, KEY_PARENT):
-            pattern = self._ns + prefix + "*"
-            batch: List[bytes] = []
-            for key in self._client.scan_iter(match=pattern, count=1000):
-                batch.append(key)
-                if len(batch) >= 1000:
-                    self._client.delete(*batch)
-                    batch = []
-            if batch:
+        # 只删本命名空间下的块:SCAN 而不是 KEYS,避免阻塞
+        pattern = self._ns + KEY_BLOCK + "*"
+        batch: List[bytes] = []
+        for key in self._client.scan_iter(match=pattern, count=1000):
+            batch.append(key)
+            if len(batch) >= 1000:
                 self._client.delete(*batch)
+                batch = []
+        if batch:
+            self._client.delete(*batch)
 
     def ping(self) -> bool:
         try:

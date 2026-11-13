@@ -23,7 +23,7 @@ from .chunking import BLOCK_SIZE
 #: 一片文本的目标大小。只影响 socket 写入次数,不影响语义。
 OUTPUT_CHUNK = 16 * 1024
 
-#: 网关每批取多少块内容 / 每批写多少块。
+#: 网关每批写多少块(限制单条 Lua 脚本的长度)。读不分批:一条脚本走完整条前缀。
 BLOCK_BATCH = 256
 
 
@@ -213,19 +213,13 @@ class PrefixReader:
     def iter_text(self, tail_chunks) -> Iterator[bytes]:
         """产出完整渲染文本片段:先是存储里的前缀,再是请求带来的尾部。"""
         if self.prefix_blocks:
-            ids = self._store.resolve(self._have_tip, self.prefix_blocks)
-            if ids is None:
+            contents = self._store.read_prefix(self._have_tip, self.prefix_blocks)
+            if contents is None:
                 raise MissingPrefix(f"tip={self._have_tip.hex()[:16]} "
                                     f"blocks={self.prefix_blocks}")
-            for i in range(0, len(ids), self._batch):
-                want = ids[i:i + self._batch]
-                got = self._store.get_many(want)
-                for bid in want:
-                    content = got.get(bid)
-                    if content is None:
-                        raise MissingPrefix(f"block={bid.hex()[:16]}")
-                    self.prefix_bytes += len(content)
-                    yield content
+            for content in contents:
+                self.prefix_bytes += len(content)
+                yield content
 
         hasher = chunking.BlockHasher(self._bs, parent=self.tip)
         pending: List[Tuple[bytes, bytes]] = []

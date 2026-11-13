@@ -471,14 +471,14 @@ def bench_redis() -> None:
     payload = build_big(829)
     text = _rendered(payload)
 
-    print("### Redis:一条 829 KB 前缀(链与正文分开)")
+    print("### Redis:一条 829 KB 前缀(一块一个 key)")
     print()
-    print("``p:{hash}`` 只存父哈希(32 B),``b:{hash}`` 只存正文;读 = 走链脚本(一次往返)"
-          "+ MGET(一次往返)。")
+    print("``blk:{hash} → parent_hex(32 B) ‖ 正文``;读 = 一条 Lua 脚本走完整条前缀"
+          "(一次往返),正文在 Python 侧用 memoryview 切掉父哈希(零拷贝)。")
     print()
-    print("| 块大小 | 块数 | 写整条(2 key/块) | 走链 | MGET | **读一次** | 单实例上限 |")
-    print("|---|---|---|---|---|---|---|")
-    for bs in (512, 2048, 4096):
+    print("| 块大小 | 块数 | 写整条(1 key/块) | **读一次** | 单实例上限 |")
+    print("|---|---|---|---|---|")
+    for bs in (512, 2048, 4096, 8192):
         store.clear()
         body = text[: len(text) // bs * bs]
         items = list(chunking.BlockHasher(bs).feed(body))
@@ -486,21 +486,25 @@ def bench_redis() -> None:
         n = len(items)
         store.put_chain(b"", items)
         t_put = _best_wall(lambda: store.put_chain(b"", items))
-        t_walk = _best_wall(lambda: store.resolve(tip, n))
-        t_get = _best_wall(lambda: store.get_many([bid for bid, _ in items]))
-        t_all = _best_wall(lambda: store.get_many(store.resolve(tip, n) or []))
-        print(f"| {bs} B | {n} | {t_put * 1e3:.2f} ms | {t_walk * 1e3:.2f} ms | "
-              f"{t_get * 1e3:.2f} ms | **{t_all * 1e3:.2f} ms** | "
-              f"**{1 / t_all:,.0f} req/s** |")
+        t_all = _best_wall(lambda: store.read_prefix(tip, n))
+        print(f"| {bs} B | {n} | {t_put * 1e3:.2f} ms | "
+              f"**{t_all * 1e3:.2f} ms** | **{1 / t_all:,.0f} req/s** |")
     print()
-    print("走链是 O(块数):每块一次 ``GETEX``(读父哈希 + 续链 TTL)加一次 ``EXPIRE``")
-    print("(续正文 TTL)。所以**块大小决定单实例上限**,高 QPS 按会话键分片:")
+    print("走链是 O(块数):每块一次 ``GET`` 加一次 ``EXPIRE``(续 TTL),同一个脚本里"
+          "走完。所以**块大小决定单实例上限**,高 QPS 按会话键分片:")
     print("实例数 = 峰值 req/s ÷ 单实例上限。")
     print()
-    print("| 块数 | 走链耗时 |")
+    # 单独建一条 512 B 的链来量「块数 → 读成本」,避免复用上面最后一种块大小的
+    # 短链(k 超过块数时会立刻判 miss,量出来的是失败路径)。
+    store.clear()
+    fixed = text[: len(text) // 512 * 512]
+    rows = list(chunking.BlockHasher(512).feed(fixed))
+    store.put_chain(b"", rows)
+    walk_tip = rows[-1][0]
+    print("| 块数(512 B/块) | 读一次(走链 + 取回正文) |")
     print("|---|---|")
-    for k in (1, 8, 64, 256, 512, len(items)):
-        tt = _best_wall(lambda: store.resolve(tip, k), samples=5)
+    for k in (1, 8, 64, 256, 512, len(rows)):
+        tt = _best_wall(lambda: store.read_prefix(walk_tip, k), samples=5)
         print(f"| {k} | {tt * 1e3:.3f} ms |")
     store.clear()
 
@@ -573,7 +577,7 @@ def bench_store_tiers() -> None:
     memory.put_chain(b"", items)
 
     def read(store) -> int:
-        return len(store.get_many(store.resolve(tip, n) or []))
+        return len(store.read_prefix(tip, n) or [])
 
     t_mem = _best(lambda: read(memory))
 
@@ -583,7 +587,7 @@ def bench_store_tiers() -> None:
     print("|---|---|---|")
     print(f"| `MemoryChainStore`(进程内,仅测试替身) | {t_mem * 1e3:.2f} ms | {1 / t_mem:,.0f} req/s |")
     print()
-    print("生产只有一个后端:Redis(读成本见上一段:走链 Lua + MGET)。")
+    print("生产只有一个后端:Redis(读成本见上一段:一条 Lua 走完链)。")
     print("**每请求的存储成本与上下文长度成正比**,这是链式前缀的固有代价。")
     print()
 

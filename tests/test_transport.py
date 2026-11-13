@@ -453,35 +453,33 @@ class TestPrefixClient:
 
 class TestChainStore:
 
-    def test_put_and_resolve(self):
+    def test_put_and_read(self):
         store = storage.MemoryChainStore()
         blocks = storage.text_blocks(b"a" * 512 + b"b" * 512, 512)
         tip = store.put_chain(b"", blocks)
         assert tip == blocks[-1][0]
-        ids = store.resolve(tip, 2)
-        assert ids == [blocks[0][0], blocks[1][0]]
-        assert store.get_many(ids)[blocks[1][0]] == b"b" * 512
+        assert list(store.read_prefix(tip, 2)) == [b"a" * 512, b"b" * 512]
 
-    def test_resolve_returns_none_when_middle_missing(self):
+    def test_read_returns_none_when_middle_missing(self):
         """前缀必须完整可走:中间缺一块就是 miss,不能拼出洞。"""
         store = storage.MemoryChainStore()
         blocks = storage.text_blocks(b"a" * 512 + b"b" * 512 + b"c" * 512, 512)
         tip = store.put_chain(b"", blocks)
         store._data.pop(blocks[1][0], None)
-        assert store.resolve(tip, 3) is None
+        assert store.read_prefix(tip, 3) is None
 
-    def test_resolve_partial_length(self):
+    def test_read_partial_length(self):
         store = storage.MemoryChainStore()
         blocks = storage.text_blocks(b"a" * 512 * 3, 512)
         tip = store.put_chain(b"", blocks)
-        assert store.resolve(tip, 1) == [blocks[-1][0]]
+        assert list(store.read_prefix(tip, 1)) == [b"a" * 512]
 
     def test_capacity_eviction(self):
         store = storage.MemoryChainStore(capacity=2)
         blocks = storage.text_blocks(b"a" * 512 * 3, 512)
         tip = store.put_chain(b"", blocks)
-        assert store.resolve(tip, 3) is None      # 头部被淘汰
-        assert store.resolve(tip, 2) is not None
+        assert store.read_prefix(tip, 3) is None      # 头部被淘汰
+        assert store.read_prefix(tip, 2) is not None
 
     def test_make_store_default(self):
         assert isinstance(storage.make_store(""), storage.MemoryChainStore)
