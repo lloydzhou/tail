@@ -139,6 +139,66 @@ class TestTailTransport:
 
 
 # ---------------------------------------------------------------------------
+# 「本地只记哈希、不存内容」这条性质
+# ---------------------------------------------------------------------------
+
+class TestLocalKnownSet:
+    """客户端的本地状态必须只是块哈希集合,不能留正文副本。"""
+
+    def test_known_set_holds_hashes_only(self):
+        from tail.transport import chunking
+
+        client = gw.TailClient()
+        payload = {"model": "m",
+                   "messages": [{"role": "user", "content": "z" * 10_000}]}
+        encoded = client.encode_request(payload)
+
+        known = client._encoder._known          # 内部集合,直接验证元素形态
+        assert known, "编码后应记下已发送的块"
+        # 每一项必须是定长块 id,而不是内容
+        assert all(len(bid) == chunking.BLOCK_ID_SIZE for bid in known)
+        # 块 id 是二进制哈希,不含正文
+        assert not any(b"zzzz" in bid for bid in known)
+        # 本地状态量与线上体积同阶,不随正文大小膨胀
+        assert len(known) * chunking.BLOCK_ID_SIZE < len(encoded)
+
+    def test_reusing_client_is_what_makes_it_cheap(self):
+        """复用同一个 client 才有缓存;每轮新建等于永远冷启动。"""
+        payload = {"model": "m",
+                   "messages": [{"role": "user", "content": "q" * 6000}]}
+
+        reused = gw.TailClient()
+        cold_then_warm = [len(reused.encode_request(payload)) for _ in range(2)]
+        assert cold_then_warm[1] < cold_then_warm[0] / 2
+
+        fresh_total = sum(len(gw.TailClient().encode_request(payload))
+                          for _ in range(2))
+        # 不复用 = 两次都是冷启动体量
+        assert fresh_total > cold_then_warm[0] + cold_then_warm[1]
+
+    def test_prefix_shape_reuse(self):
+        """复用是前缀形状的:往中间插一条消息,后面全部失效。"""
+        head = [{"role": "system", "content": "s" * 2000}]
+        client = gw.TailClient()
+        base = client.encode_request(
+            {"model": "m", "messages": head + [{"role": "user", "content": "a" * 2000}]})
+
+        # 纯追加:几乎全命中
+        appended = client.encode_request(
+            {"model": "m", "messages": head
+             + [{"role": "user", "content": "a" * 2000},
+                {"role": "assistant", "content": "b" * 50}]})
+        # 插在中间:前缀断裂,后续块哈希全变
+        inserted = client.encode_request(
+            {"model": "m", "messages": [head[0],
+                                        {"role": "user", "content": "X"},
+                                        {"role": "user", "content": "a" * 2000}]})
+
+        assert len(appended) < len(base)          # 追加几乎免费
+        assert len(inserted) > len(appended)      # 中间插入代价高
+
+
+# ---------------------------------------------------------------------------
 # 真实 openai SDK
 # ---------------------------------------------------------------------------
 

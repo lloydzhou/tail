@@ -104,6 +104,26 @@ for event in client.chat.completions.create(
 
 异步用 `AsyncOpenAI` + `httpx2.AsyncClient(transport=TailAsyncTransport())`。
 
+### 客户端只记哈希，不缓存内容
+
+本地状态只有一个「网关已有块」的哈希集合（16 字节/块，约 70 B/块），**不留正文副本**。
+编码时命中就只发 17 字节引用帧。实测约 79 KB 上下文（174 个满块）：
+
+| | |
+| --- | --- |
+| 本地集合占内存 | 12 KB |
+| 冷启动上行 | 82,422 B |
+| 全命中后上行 | 6,054 B（省 92.7%） |
+
+三点要注意：
+
+1. **必须复用同一个 client 实例**——集合挂在 client 上，每轮新建 `OpenAI(...)`
+   等于永远冷启动（6 轮合计 283 KB vs 61 KB）。
+2. **复用是前缀形状的**——块哈希沿用 vLLM 的父链 `hash(parent, block)`，纯追加几乎
+   免费，往中间插一句则其后全部失效。
+3. **没有逐块 ACK**——客户端乐观假设「发出去的对端就存下了」，对端存储被清空时用
+   `X-Tail-Retransmit` 通知，客户端全量重发一次（多一次往返，不会错内容）。
+
 `TailTransport` 只拦截 `/chat/completions` 的 JSON 请求，其余请求（`/models`、
 embeddings、文件上传……）原样透传；网关回 `X-Tail-Retransmit` 时它自动清空本地
 已知块集合并重发一次全量，对上层透明。
@@ -204,7 +224,7 @@ blk:{block_hash} → 块内容
 python -m pytest tests/ -v
 ```
 
-82 个测试，覆盖分块与前缀复用、帧格式往返、渲染确定性、编解码、存储后端、
+85 个测试，覆盖分块与前缀复用、帧格式往返、渲染确定性、编解码、存储后端、
 「客户端 → ASGI 网关 → mock 上游」的端到端链路（含存储失效降级与恢复），
 以及用真实 `openai` SDK 经 `TailTransport` 接入的回归测试。
 

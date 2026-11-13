@@ -315,6 +315,40 @@ Content-Type → application/x-tail-v2,删掉 Content-Length(改 chunked)
 只拦 `/chat/completions` 且 `Content-Type` 含 `json` 的请求；其余（`/models`、
 embeddings、文件上传）原样透传。body 不是合法 JSON 时也不猜，原样发出。
 
+#### 本地状态:只记哈希集合,不缓存内容
+
+客户端**不留正文副本**。`codec.Encoder` 只维护一个「对端已有块」的哈希集合：
+
+```
+block_hash in known  →  17 字节引用帧
+否则                  →  新块帧(带内容)，并把哈希加入 known
+```
+
+键是 16 字节块 id，值是「有」这一事实。实测（约 79 KB 上下文、174 个满块）：
+
+| 项 | 量 |
+| --- | --- |
+| 已知集合净占内存 | 12,128 B ≈ **70 B/块** |
+| 冷启动线上体积 | 82,422 B |
+| 全命中后线上体积 | 6,054 B（省 92.7%） |
+
+即：用本地约 12 KB 的哈希集合，换掉每轮约 76 KB 的上行内容。
+
+三个必须知道的边界：
+
+1. **必须复用同一个 client 实例**。集合挂在 `TailClient` 上——每轮
+   `OpenAI(...)` 新建一个就等于永远冷启动（实测 6 轮合计 283 KB vs 61 KB，
+   差 78%）。`TailTransport` 因此随 `http_client` 活，要和 SDK client 同寿命。
+2. **复用是前缀形状的，不是任意块去重**。块哈希沿用 vLLM 的父链
+   （`bid = hash(parent, block)`），所以一句「插入到中间」会让其后所有块哈希改变，
+   全部失效；纯追加才几乎免费。这与 vLLM 前缀缓存、DeepSeek 上下文缓存的语义一致。
+3. **没有逐块 ACK**。客户端是乐观假设「发出去的对端就存下了」。服务端存储被清空
+   或淘汰时，用 `X-Tail-Retransmit` 一次性告知，客户端 `invalidate()` 后全量重发一次。
+   代价是一次多余的往返，不会出现内容错误（新块帧自带完整内容）。
+
+集合本身不做淘汰（无 LRU）：客户端进程的内存增长远小于它省下的流量；但如果对端
+块存储有 TTL，客户端并不知道，只会在下次 miss 时经 `X-Tail-Retransmit` 自愈。
+
 ### 6.2 启动 HTTP chunked 到上游
 
 网关用 `httpx2` 的 `AsyncByteStream` 适配:每次 `next()` 得到一个 JSON 片段就
