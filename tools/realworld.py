@@ -77,10 +77,11 @@ class Magpie:
         if out.returncode != 0:
             raise RuntimeError(f"provider add {name}: {out.stderr or out.stdout}")
 
-    def start(self) -> None:
+    def start(self, log: Optional[str] = None) -> None:
+        """起 serve。传 log 就把 stderr 落到那个文件(调试用)。"""
+        err = open(log, "wb") if log else subprocess.DEVNULL
         self.proc = subprocess.Popen([self.binary, "serve"], env=self.env(),
-                                     stdout=subprocess.DEVNULL,
-                                     stderr=subprocess.DEVNULL)
+                                     stdout=subprocess.DEVNULL, stderr=err)
 
     def wait(self, timeout: float = 40) -> None:
         url = f"http://{self.addr}/v1/models"

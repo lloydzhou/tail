@@ -203,22 +203,25 @@ class ThrottledRelay:
         "Task was destroyed but it is pending",测试里满屏噪声。
         """
         async def shutdown() -> None:
+            # 顺序要紧:先掐掉在跑的连接任务,再关 listener 并等它真的关掉。
+            # **不要**自己去 close 那个监听 socket —— asyncio 的 selector 还登记着
+            # 它的 fd,从别的线程关掉会让收尾时的 select 报
+            # `Invalid file descriptor: -1`(关是关掉了,但每次都刷一屏噪声)。
             for t in asyncio.all_tasks():
                 if t is not asyncio.current_task():
                     t.cancel()
             await asyncio.sleep(0)
+            if self._srv is not None:
+                self._srv.close()
+                try:
+                    await self._srv.wait_closed()
+                except Exception:           # noqa: BLE001
+                    pass
         try:
             fut = asyncio.run_coroutine_threadsafe(shutdown(), self._loop)
             fut.result(timeout=3)
         except Exception:                   # noqa: BLE001 — 关得掉就行
             pass
-        if self._srv is not None:
-            self._loop.call_soon_threadsafe(self._srv.close)
-        if self._sock is not None:
-            try:
-                self._sock.close()
-            except OSError:
-                pass
         self._loop.call_soon_threadsafe(self._loop.stop)
 
 
