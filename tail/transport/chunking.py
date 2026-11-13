@@ -21,45 +21,27 @@ vLLM:https://docs.vllm.ai/en/v0.8.3/_sources/design/v1/prefix_caching.md
 DeepSeek 侧对应的是"按固定 token 间隔落盘"(上下文硬盘缓存文档),
 同样是固定 token 间隔,不是按内容找切点。
 
-本层工作在**字节**上
---------------------
-网关这一侧拿不到 tokenizer,所以块大小按字节定义(``#: 定长块的字节数。**必须全局固定,不能按请求体大小自适应。**
-#:
-#: 固定是跨请求复用的前提:同一段前缀在一个 1 KB 的请求和一个 1 MB 的请求里
-#: 必须切出**相同**的块边界,否则两轮对话之间一个块都命中不了。看到「短请求下
-#: 512 B 只有一两块、帧头占比偏高」时,不要去做自适应块大小——那会彻底破坏复用。
-#:
-#: 512 的来历见 docs/TRANSPORT-PIPELINE.md §4.3(帧头占比 vs 复用粒度的权衡)。
-BLOCK_SIZE = 512``)。
-**不能照抄 vLLM 的 16 token**:16 token 的中文换算约 48 字节,而本层每块要付
-21 字节帧头,实测反而比不发引用帧更差。具体扫参见 ``BLOCK_SIZE`` 处的注释。
-
-注意块大小**必须全局固定**,不能按请求体大小自适应——同一个前缀在 1KB 请求和
-1MB 请求里必须切出同样的块边界,否则跨轮复用一个块都命中不了。
+本层工作在**字节**上:网关这一侧拿不到 tokenizer,所以块大小按字节定义,
+而不是 vLLM 的 16 token(中文约 48 字节)。粒度依据见 ``BLOCK_SIZE`` 与
+``docs/TRANSPORT-PIPELINE.md`` §4.3。
 """
 
 from __future__ import annotations
 
 import hashlib
-from typing import Iterator, List, Optional, Tuple
+from typing import Iterator, List, Tuple
 
 #: 每块的字节数。对应 vLLM 的 ``block_size``(默认 16 tokens)。
 #:
-#: 为什么不是 16 token 直接换算成字节(中文约 48 字节):本层每块要付
-#: 1+16 字节的帧头,48 字节的块光帧头就占 35%,实测反而比不发引用帧更慢
-#: (省 -2%)。字节流的"复用单位价值"与 token 不同,粒度要按实测定。
+#: 为什么不照抄 16 token(中文约 48 字节):v3 里每读一次前缀都要从链尾一跳一跳
+#: 走到链头,**走链跳数 = 上下文长度 / 块大小**。829 KB 按 512 B 切是 1,774 跳,
+#: 按 48 B 切就是 17,706 跳(存储读成本差 10 倍),换来的只是「每轮少重发
+#: 400 字节的尾巴」。粒度要按走链成本定,不是按 token 定。
 #:
-#: 实测(20 轮对话,上下文约 3.8KB):
-#:     48B → -2%    64B → 19%    128B → 52%
-#:    256B → 66%   512B → 69%   1024B → 68%   4096B → 26%
-#: 512 取在平台区,再小帧头占比上升,再大复用粒度变粗。
-#: 定长块的字节数。**必须全局固定,不能按请求体大小自适应。**
+#: 必须全局固定,不能按请求体大小自适应:同一个前缀在 1 KB 请求和 1 MB 请求里
+#: 必须切出**相同**的块边界,否则跨轮复用一个块都命中不了。
 #:
-#: 固定是跨请求复用的前提:同一段前缀在一个 1 KB 的请求和一个 1 MB 的请求里
-#: 必须切出**相同**的块边界,否则两轮对话之间一个块都命中不了。看到「短请求下
-#: 512 B 只有一两块、帧头占比偏高」时,不要去做自适应块大小——那会彻底破坏复用。
-#:
-#: 512 的来历见 docs/TRANSPORT-PIPELINE.md §4.3(帧头占比 vs 复用粒度的权衡)。
+#: 详见 ``docs/TRANSPORT-PIPELINE.md`` §4.3 的「跳数 / 尾块」对照表。
 BLOCK_SIZE = 512
 
 #: 块哈希字节数。vLLM 用整型 hash;Borg 要求 id 必须是密码学强哈希,
@@ -149,10 +131,17 @@ class BlockHasher:
 
     __slots__ = ("_block_size", "_buf", "_parent")
 
-    def __init__(self, block_size: int = BLOCK_SIZE) -> None:
+    def __init__(self, block_size: int = BLOCK_SIZE,
+                 parent: bytes = b"") -> None:
+        """
+        Args:
+          block_size: 定长块字节数
+          parent: 链上前一个满块的哈希。从头切时为空;v3 网关续写一段前缀时,
+                  传入那段前缀的链尾,于是新块的哈希天然挂在前缀之下。
+        """
         self._block_size = block_size
         self._buf = bytearray()
-        self._parent = b""              # 链上前一个满块的哈希
+        self._parent = parent
 
     def feed(self, data: bytes) -> Iterator[Tuple[bytes, bytes]]:
         """喂入字节,产出 ``(block_hash, block)``。只产出**满块**。"""
@@ -165,6 +154,18 @@ class BlockHasher:
             bid = block_hash(block, self._parent)
             self._parent = bid
             yield bid, block
+
+    def take_pending(self) -> bytes:
+        """取走「已喂入但还不满一块」的字节,并清空缓冲。
+
+        v3 客户端扫到匹配边界后要接着发尾部:那些字节已经被 ``feed`` 吃掉存在
+        缓冲里,必须显式取出来交给 body,否则尾部会丢掉这一段。
+        """
+        if not self._buf:
+            return b""
+        out = bytes(self._buf)
+        self._buf = bytearray()
+        return out
 
     def flush(self) -> Iterator[Tuple[bytes, bytes]]:
         """冲刷不满的尾块。调用方不应把它当"可复用块"缓存。
