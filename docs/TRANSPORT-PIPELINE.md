@@ -287,18 +287,46 @@ vLLM 的 16 token 换算成中文约 48 字节。但本层每块要付 `1+16+4 =
 ⑦ 上游:收到标准 OpenAI JSON —— 它不知道 Tail 存在
 ```
 
-### 6.1 启动 HTTP chunked 到上游
+### 6.1 客户端接入点:TailTransport
 
-网关用 `httpx` 的 `AsyncByteStream` 适配:每次 `next()` 得到一个 JSON 片段就
+第 ① 步的入口是 `TailClient.iter_encode_request(payload)`，但上层（`openai` SDK）
+只会交出**已经序列化好的 JSON body**。要把它换成帧流，需要一个「body 改写」的
+接入点。
+
+选 `httpx2` 的 **transport**，不选 openai SDK 的内部方法：
+
+| 接入点 | 可行性 |
+| --- | --- |
+| monkey-patch `openai` 私有方法 | 旧实现的做法。旧协议只需改 `options.json_data` 加个头，可行；新协议要把整个 body 换成**二进制流**，还得维护本地已知块集合，SDK 内部改不动 |
+| 应用层手写 HTTP | 可行但要求用户重写全部调用代码，违背「现有代码不变」 |
+| **`httpx2.Client(transport=...)`** | ✅ 公开扩展点，SDK 内部结构一行不碰，只替换「字节怎么发出去」 |
+
+`TailTransport.handle_request` 做的事：
+
+```
+request.read()                  → 已序列化的 JSON body
+json.loads                      → payload dict
+iter_encode_request(payload)    → 帧流生成器(不落地、不拼大 bytes)
+Content-Type → application/x-tail-v2,删掉 Content-Length(改 chunked)
+内层 transport.handle_request   → 真正发出
+响应带 X-Tail-Retransmit        → client.invalidate() 后全量重发一次
+```
+
+只拦 `/chat/completions` 且 `Content-Type` 含 `json` 的请求；其余（`/models`、
+embeddings、文件上传）原样透传。body 不是合法 JSON 时也不猜，原样发出。
+
+### 6.2 启动 HTTP chunked 到上游
+
+网关用 `httpx2` 的 `AsyncByteStream` 适配:每次 `next()` 得到一个 JSON 片段就
 立刻 `yield`,不等全部生成完。解码是 CPU 密集的同步代码,放进**单线程**
 `ThreadPoolExecutor`(惰性迭代器非线程安全,用默认线程池会丢消息)。
 
-### 6.2 普通 JSON 透传路径
+### 6.3 普通 JSON 透传路径
 
 `Content-Type` 不是 `application/x-tail-v2` 时,网关**原样转发**,同样直接透传
 `request.stream()`——不先收齐。用于灰度对比与排障。
 
-### 6.3 流式性的实测证据
+### 6.4 流式性的实测证据
 
 body 34610B / 34 片,每片间隔 20ms:
 

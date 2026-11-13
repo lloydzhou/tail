@@ -83,21 +83,54 @@ pip install -e ".[test]"
 python -m tail.serve --backend https://api.deepseek.com --port 8765 --dbm ./blocks.db
 ```
 
-客户端：
+客户端：**现有的 `openai` 代码不用改请求逻辑**，只多传一个 `http_client`。
+
+```python
+import httpx2
+from openai import OpenAI
+from tail.transport.client import TailTransport
+
+client = OpenAI(
+    base_url="http://127.0.0.1:8765/v1",
+    api_key="sk-xxx",
+    http_client=httpx2.Client(transport=TailTransport()),   # ← 唯一新增
+)
+
+# 下面和原生用法一模一样，流式也一样
+for event in client.chat.completions.create(
+        model="deepseek-chat", messages=messages, stream=True):
+    print(event.choices[0].delta.content or "", end="")
+```
+
+异步用 `AsyncOpenAI` + `httpx2.AsyncClient(transport=TailAsyncTransport())`。
+
+`TailTransport` 只拦截 `/chat/completions` 的 JSON 请求，其余请求（`/models`、
+embeddings、文件上传……）原样透传；网关回 `X-Tail-Retransmit` 时它自动清空本地
+已知块集合并重发一次全量，对上层透明。
+
+完整可运行示例见 [examples/chat.py](examples/chat.py)（原生）与
+[examples/chat_tail.py](examples/chat_tail.py)（接入 Tail），两者 diff 只有 3 行。
+
+网关也接受普通 `application/json` 请求并原样转发，便于灰度对比与排障。
+
+### 依赖说明：为什么是 `httpx2`
+
+`httpx` 稳定版停在 0.28.1（后续只有 `1.0.dev*` 预发布），继任包是
+[`pydantic/httpx2`](https://github.com/pydantic/httpx2)（同一作者 Tom Christie）。
+`openai` 3.x 已依赖 `httpx2`，Starlette 1.10 的 `TestClient` 也优先用 `httpx2`
+并对 `httpx` 报弃用警告。所以本项目统一用 `httpx2`，客户端与网关只有一套 HTTP 栈。
+
+`TailTransport` 本身与库无关：它按请求对象所属的库自动选择内层 transport，
+因此仍在用 `httpx` 的 `openai` 1.x 也能直接接。
+
+### 直接用底层 API（不用 SDK）
 
 ```python
 from tail.transport.gateway import TailClient
 
 client = TailClient()
-
-# 每轮把完整 messages 交给它，返回的就是要发的 body
-body = client.encode_request({
-    "model": "deepseek-chat",
-    "messages": messages,
-})
-
-# 以帧流形式发给网关
-resp = httpx.post(
+body = client.encode_request({"model": "deepseek-chat", "messages": messages})
+resp = httpx2.post(
     "http://127.0.0.1:8765/v1/chat/completions",
     content=body,
     headers={"content-type": "application/x-tail-v2",
@@ -106,8 +139,6 @@ resp = httpx.post(
 if resp.headers.get("x-tail-retransmit"):
     client.invalidate()          # 缓存失效，下一轮重发全文
 ```
-
-网关也接受普通 `application/json` 请求并原样转发，便于灰度对比与排障。
 
 ## 线上格式
 
@@ -173,8 +204,9 @@ blk:{block_hash} → 块内容
 python -m pytest tests/ -v
 ```
 
-67 个测试，覆盖分块与前缀复用、帧格式往返、渲染确定性、编解码、存储后端、
-以及「客户端 → ASGI 网关 → mock 上游」的端到端链路（含存储失效降级与恢复）。
+82 个测试，覆盖分块与前缀复用、帧格式往返、渲染确定性、编解码、存储后端、
+「客户端 → ASGI 网关 → mock 上游」的端到端链路（含存储失效降级与恢复），
+以及用真实 `openai` SDK 经 `TailTransport` 接入的回归测试。
 
 ## 目录
 
@@ -188,10 +220,15 @@ tail/
     ├── chunking.py       # 定长分块 + block_hash
     ├── frames.py         # 帧格式
     ├── storage.py        # 块存储后端
-    └── gateway.py        # 串成请求路径
+    ├── gateway.py        # 串成请求路径（TailClient / TailGateway）
+    └── client.py         # 客户端接入：TailTransport（给 openai SDK 用）
+examples/
+├── chat.py               # 原生 openai 流式对话
+└── chat_tail.py          # 同一份代码接入 Tail（diff 仅 3 行）
 tests/
 ├── test_transport.py     # 单元 + 集成
 ├── test_e2e.py           # 端到端（真 ASGI + mock 上游）
+├── test_client_transport.py  # TailTransport / 真实 openai SDK
 └── mock_backend.py       # 模拟上游推理服务
 docs/
 └── TRANSPORT-PIPELINE.md           # 协议、数据管线与设计动机
