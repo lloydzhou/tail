@@ -254,39 +254,99 @@ vLLM 的 16 token 换算成中文约 48 字节。但本层每块要付 `1+16+4 =
 
 ---
 
-## 6. 传输管线(逐步骤)
+## 6. 传输管线
 
 **整条链路全程流式**。没有任何一步会先把整个请求体收进内存。
 
+### 6.0 全景图:hash 在哪算、缓存何时读写、字节怎么走
+
+阶段编号 ①~⑪ 与下面各小节的对应关系在括号里标出。
+
 ```
-① 客户端:iter_encode_request(payload)                      [流式生成]
-     render.iter_render(payload)        → 文本片段流
-     chunking.BlockHasher.feed(piece)   → 满块 (block_hash, block)
-     codec.Encoder._encode_block        → 引用帧 或 新块帧
-                                         (已知块 → 17B 引用帧,否则 → 新块帧)
+【客户端进程：TailTransport 随 http_client 活，状态都在这里】
 
-② 公网:HTTP chunked transfer                                [边生成边发]
+  OpenAI SDK
+    │  已序列化的 JSON body —— 客户端唯一一份完整副本，而且是 bytes
+    ▼
+  ① TailTransport.handle_request                    （§6.1）
+    │    json.loads → payload dict
+    ▼
+  ② render.iter_render(payload)                     （§3）
+    │    messages JSON → 一维文本片段流；确定性渲染是全部缓存的前提
+    ▼
+  ③ chunking.BlockHasher.feed(piece)          ◀◀◀  hash 在这里算（客户端）
+    │    攒满 512 B 出一个满块
+    │    block_hash = blake2b(parent_hash ‖ block)[:16]
+    │    父链保证「同内容不同前缀 → 不同 id」，即前缀语义（与 vLLM 一致）
+    │    只把满块交出去；尾块每轮重发（内容还会变，缓存它没意义）
+    ▼
+  ④ Encoder._encode_block(bid, block)         ◀◀◀  缓存「读」= 查本地 known 集合
+    │    bid ∈ known ?
+    │      ├─ 是 → 引用帧   1 + 16      = 17 B   （不发内容）
+    │      └─ 否 → 新块帧   1 + 16 + 512 = 529 B  （内容全发）→ known.add(bid)
+    ▼
+  ⑤ codec._coalesce(16 KB)                          （§6.5）
+    │    把上千个 17 B 小帧并成 ~16 KB 一片
+    ▼
+  ⑥ httpx2 内层 transport → HTTP/1.1 chunked        （§6.2）
+         Content-Type: application/x-tail-v2，删除 Content-Length
+         800 KB 上下文（1,600 块）：冷启动 1,600×529 = 846,400 B（≈827 KB），
+         全命中 1,600×17 = 27,200 B（≈27 KB）—— 帧头就是全命中时的全部线上内容
 
-③ 网关:request.stream() → _AsyncToSyncBody                 [流式接收 + 背压]
-     后台协程持续读 request.stream(),片段放进**有界队列**(maxsize=8)。
-     队列满 → 后台 pump 阻塞 → 不把整个 body 读进内存。
-     同步解码器在另一线程从队列取,通过 executor 桥接。
+【公网】只走需要的字节。上行是这里唯一稀缺的东西。
 
-④ 网关:codec.Decoder.feed(chunk)                           [流式解码]
-     frames.FrameDecoder.feed(chunk)    → 逐帧
-     引用帧 → 查 storage.get_many() 取块内容
-     新块帧 → 内容直传,同时 put_many() 入库
-                                         → 文本片段流
+【网关进程】
 
-⑤ 网关:render.RenderParser.feed(piece)                     [流式反渲染]
-     按 <|标记|> 切分,正文/字段值用 json.loads 还原
-                                         → (PARAM | MESSAGE_START | MESSAGE_END)
+  ⑦ request.stream() → _AsyncToSyncBody              （§6.2 / §6.4）
+    │    有界队列 maxsize=8 提供背压：解码慢则后台协程阻塞，不会整包落内存
+    ▼
+  ⑧ frames.FrameDecoder.feed → (kind, payload)
+    │    new → (block_hash, content)   ← hash 是发送方算好随帧传来的，网关不算
+    │    ref → block_hash              ← 网关只有 id，没有内容
+    ▼
+  ⑨ 缓存「读」：storage.get_many(refs)        ◀◀◀  唯一的外部存储读
+    │    ref → 按 id 取块（Redis MGET，一次往返取回全部引用块）
+    │    new → 内容直传，同时 put_many 入库（唯一的回写点）
+    │    取不到 → MissingBlock → 立刻断上游 + 409（§8），绝不跳过继续解
+    ▼
+  ⑩ render.RenderParser.feed(piece)                  （§3）
+    │    <|标记|> 切分 + json.loads 还原 → (PARAM | MESSAGE_START | MESSAGE_END)
+    ▼
+  ⑪ iter_payload_json → _AsyncJsonStream             （§6.2）
+    │    首片立刻发（不凑批），之后每 256 KB 一批，每条 message 完成即序列化
+    ▼
+  上游 LLM —— 它不知道 Tail 存在
 
-⑥ 网关:iter_payload_json → _AsyncJsonStream                [流式重建 + 转发]
-     每条 message 完成即刻序列化成 JSON 片段,边发上游
+【响应方向】
 
-⑦ 上游:收到标准 OpenAI JSON —— 它不知道 Tail 存在
+  上游 SSE ──── 原样逐块透传 ────> 客户端 SDK
+    网关附加 X-Tail-Version / X-Tail-Status / X-Tail-Hit
+    缺块时改为 409 + X-Tail-Retransmit: 1
+    客户端 TailTransport 看到该头 → invalidate() → 重发一次（对 SDK 透明）
 ```
+
+**状态归属**——「谁记得什么」是这套设计的核心,所有坑都出在这张表上:
+
+| 状态 | 谁持有 | 生命周期 | 800 KB 上下文下的大小 |
+| --- | --- | --- | --- |
+| 渲染文本 | 没人落地 | 随流通过 | 0（只有片段） |
+| 块顺序 | **请求的帧序列本身** | 一次请求 | 由帧顺序表达，不额外存 |
+| 块哈希 | 客户端算，随帧传给网关 | 一次请求 | 引用帧里 16 B/块 |
+| 「对端有哪些块」 | 客户端 `Encoder._known` | 随 client 实例，**无淘汰** | **210 KB**（131 B/块） |
+| 块内容 | 网关存储（Redis / dbm） | TTL 或 LRU | 822 KB 原始内容 |
+| 缺块判定 | 网关 `Decoder.missing` | 一次请求 | — |
+
+三个直接后果:
+
+1. **hash 必须在客户端算**——因为「发引用还是发内容」是发送方在发出那一刻就要做的
+   决策；服务端要把字节收下来才能算 hash,而那正是客户端想省掉的那件事（循环依赖）。
+2. **网关不校验客户端声称的 hash**——它没有父链,只能信。这是当前唯一的正确性
+   缺口（§11），修法是让解码器自己维护父链重算，不改线缆。
+3. **客户端 known 集合无界**——服务端嵌 SDK 的形态下随会话数线性涨。
+
+与已定方向的差距（未实现，设计未定稿）:把 ④ 的逐块引用换成「前缀凭据 (长度, 摘要)」、
+把 ③ 的 hash 挪到网关、把 ⑨ 的「按 id 取块」换成「按前缀凭据走存储里的链」——
+那时 ④ 会发 17 B/块 × 1,600 = 27 KB 的东西只剩下一个请求头。
 
 ### 6.1 客户端接入点:TailTransport
 
