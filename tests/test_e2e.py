@@ -40,16 +40,31 @@ def backend():
 
 @pytest.fixture
 def gateway_app(backend):
-    st = storage.MemoryStorage()
+    st = storage.MemoryChainStore()
     app = serve.build_app("http://mock", st)
     app.state.client = httpx.AsyncClient(
         transport=httpx.ASGITransport(app=backend), timeout=30)
     return app
 
 
-def _post(tc, body):
-    return tc.post("/v1/chat/completions", content=body,
-                   headers={"content-type": gw.CONTENT_TYPE_BLOCKS})
+def _post(tc, body, session=b"", have_len=0, have_tip=b""):
+    """按 v3 线缆发一个请求:会话键 + 前缀凭据走头,body 只有尾部字节。"""
+    headers = {"content-type": gw.CONTENT_TYPE_BLOCKS}
+    if session:
+        headers[gw.HEADER_SESSION] = session.hex()
+    if have_len:
+        headers[gw.HEADER_HAVE] = f"{have_len};{have_tip.hex()}"
+    return tc.post("/v1/chat/completions", content=body, headers=headers)
+
+
+def _send(tc, client, payload):
+    """客户端 prepare → 发 → 用响应头更新凭据。返回 (响应, 线上字节数)。"""
+    prepared = client.prepare(payload)
+    body = b"".join(prepared.body)
+    r = _post(tc, body, prepared.session, prepared.have_len, prepared.have_tip)
+    if r.status_code == 200:
+        client.update_from_headers(prepared.session, r.headers)
+    return r, len(body)
 
 
 class TestAsyncToSyncBody:
@@ -108,7 +123,9 @@ class TestEndToEnd:
             msgs.append({"role": "user", "content": f"q{i}:" + _sent(rng, 40)})
             msgs.append({"role": "assistant", "content": f"a{i}:" + _sent(rng, 40)})
         payload = {"model": "deepseek-chat", "messages": msgs}
-        body = gw.TailClient(block_size=256).encode_request(payload)
+        prepared = gw.TailClient(block_size=256).prepare(payload)
+        body = b"".join(prepared.body)
+        assert prepared.have_len == 0
 
         pieces = [body[i:i + 1024] for i in range(0, len(body), 1024)]
         assert len(pieces) >= 8, "请求体要够大才能观察分段效果"
@@ -130,7 +147,8 @@ class TestEndToEnd:
                 return await client.post(
                     "http://tail.test/v1/chat/completions",
                     content=gen(),
-                    headers={"content-type": gw.CONTENT_TYPE_BLOCKS})
+                    headers={"content-type": gw.CONTENT_TYPE_BLOCKS,
+                             gw.HEADER_SESSION: prepared.session.hex()})
 
         r = asyncio.run(run())
         assert r.status_code == 200
@@ -157,7 +175,7 @@ class TestEndToEnd:
         with TestClient(gateway_app) as tc:
             for turn in range(1, 16):
                 msgs.append({"role": "user", "content": f"问{turn}:" + _sent(rng, 40)})
-                r = _post(tc, client.encode_request({"model": "x", "messages": msgs}))
+                r, _ = _send(tc, client, {"model": "x", "messages": msgs})
                 assert r.status_code == 200
                 assert backend.state.received[-1]["messages"] == msgs
                 msgs.append({"role": "assistant",
@@ -178,10 +196,9 @@ class TestEndToEnd:
         with TestClient(gateway_app) as tc:
             for turn in range(1, 21):
                 msgs.append({"role": "user", "content": f"追问{turn}:" + _sent(rng, 50)})
-                body = client.encode_request({"model": "x", "messages": msgs})
-                r = _post(tc, body)
+                r, sent = _send(tc, client, {"model": "x", "messages": msgs})
                 assert r.status_code == 200
-                sizes.append(len(body))
+                sizes.append(sent)
                 ctx.append(sum(len(m["content"]) for m in msgs))
                 msgs.append({"role": "assistant",
                              "content": f"回答{turn}:" + _sent(rng, 50)})
@@ -202,9 +219,10 @@ class TestEndToEnd:
         ]}
         client = gw.TailClient()
         with TestClient(gateway_app) as tc:
-            client.encode_request(payload)
+            assert _send(tc, client, payload)[0].status_code == 200
             gateway_app.state.storage.clear()
-            r = _post(tc, client.encode_request(payload))
+            r, _ = _send(tc, client, payload)
+        assert r.status_code == 409
         assert r.headers[gw.HEADER_RETRANSMIT] == "1"
 
     def test_mid_block_miss_returns_409_without_inference(self, gateway_app, backend):
@@ -222,21 +240,20 @@ class TestEndToEnd:
             {"role": "user", "content": "继续"},
         ]}
         client = gw.TailClient()
-        cold = client.encode_request(payload)
         with TestClient(gateway_app) as tc:
-            assert _post(tc, cold).status_code == 200
+            assert _send(tc, client, payload)[0].status_code == 200
             before = len(backend.state.received)
             ids = list(gateway_app.state.storage._data)
             assert len(ids) >= 3, "需要足够多的块才能挖中间洞"
             gateway_app.state.storage._data.pop(ids[1])     # 挖掉中间一块
-            r = _post(tc, client.encode_request(payload))
+            r, _ = _send(tc, client, payload)
             assert r.status_code == 409
             assert r.headers.get(gw.HEADER_RETRANSMIT) == "1"
             assert r.headers.get(gw.HEADER_STATUS) == gw.CACHE_DEGRADED
             assert len(backend.state.received) == before, "缺块时不该有上游推理"
             # 客户端按重发信号重来一次:恢复成正确请求
             client.invalidate()
-            r2 = _post(tc, client.encode_request(payload))
+            r2, _ = _send(tc, client, payload)
             assert r2.status_code == 200
             assert backend.state.received[-1]["messages"] == payload["messages"]
 
@@ -248,12 +265,12 @@ class TestEndToEnd:
         ]}
         client = gw.TailClient()
         with TestClient(gateway_app) as tc:
-            client.encode_request(payload)
+            assert _send(tc, client, payload)[0].status_code == 200
             gateway_app.state.storage.clear()
-            r1 = _post(tc, client.encode_request(payload))
+            r1, _ = _send(tc, client, payload)
             assert r1.headers.get(gw.HEADER_RETRANSMIT) == "1"
             client.invalidate()          # 客户端按响应头重发全文
-            r2 = _post(tc, client.encode_request(payload))
+            r2, _ = _send(tc, client, payload)
             assert r2.status_code == 200
             assert backend.state.received[-1]["messages"] == payload["messages"]
 
@@ -265,6 +282,9 @@ class TestEndToEnd:
         ]}
         client = gw.TailClient()
         with TestClient(gateway_app) as tc:
-            _post(tc, client.encode_request(payload))     # 第一轮建立缓存
-            r = _post(tc, client.encode_request(payload))
-        assert float(r.headers[gw.HEADER_HIT]) == 1.0
+            _, cold = _send(tc, client, payload)          # 第一轮建立缓存
+            r, warm = _send(tc, client, payload)
+        # 只有整块能进缓存:重复请求只需重发不足一块的尾巴
+        assert warm < cold / 2
+        assert warm < 300, f"重复请求还发了 {warm}B"
+        assert float(r.headers[gw.HEADER_HIT]) > 0.6

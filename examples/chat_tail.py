@@ -14,8 +14,8 @@ from openai import OpenAI
 
 from tail.transport.client import TailTransport
 
-# 同一个 client 复用:它在本地维护「网关已有哪些块」,
-# 第二轮起只发引用帧。换成 AsyncOpenAI 就用 TailAsyncTransport。
+# 同一个 client 必须复用:它按会话保存「网关已有哪些前缀」的凭据,
+# 第二轮起请求体只剩新增的那一段。换成 AsyncOpenAI 就用 TailAsyncTransport。
 client = OpenAI(
     base_url="http://127.0.0.1:8765/v1",
     api_key="sk-xxx",

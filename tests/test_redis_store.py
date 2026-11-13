@@ -1,0 +1,181 @@
+"""Redis 链式存储的真实集成测试(需要一台可连的 Redis)。
+
+默认连 ``redis://127.0.0.1:6390/0``,可用 ``TAIL_REDIS_URL`` 覆盖。
+连不上就整体 skip——CI 上不该因为它挂掉,但本地必须能跑通:
+Lua、定长 parent 编码、TTL 续期这些东西**只有**真跑过 Redis 才算验证。
+
+一条命令起一个临时实例::
+
+    docker run -d --rm -p 6390:6379 redis:7-alpine
+"""
+
+from __future__ import annotations
+
+import os
+import random
+import time
+
+import pytest
+
+redis = pytest.importorskip("redis")
+
+from tail.transport import storage  # noqa: E402
+from tail.transport.gateway import roundtrip  # noqa: E402
+
+_URL = os.environ.get("TAIL_REDIS_URL", "redis://127.0.0.1:6390/0")
+
+
+@pytest.fixture(scope="module")
+def client():
+    try:
+        c = redis.Redis.from_url(_URL, socket_connect_timeout=1)
+        c.ping()
+    except Exception as exc:  # pragma: no cover - 环境缺失
+        pytest.skip(f"连不上 Redis({_URL}):{exc}")
+    yield c
+    c.close()
+
+
+@pytest.fixture
+def store(client):
+    st = storage.RedisChainStore(client, ttl=60, namespace="tailtest")
+    st.clear()
+    yield st
+    st.clear()
+
+
+def _chain(text: str, block_size: int = 64):
+    """切满块。不满一块的尾巴不进链(与线上一致),所以用例断言时要按满块长度比。"""
+    items = storage.text_blocks(text.encode(), block_size)
+    return items, text.encode()[:len(items) * block_size]
+
+
+class TestRedisChainStore:
+    def test_put_and_resolve_roundtrip(self, store):
+        text = "".join(chr(0x4e00 + i % 500) for i in range(400))   # 多字节正文
+        items, want = _chain(text, 64)
+        assert len(items) >= 3
+        tip = store.put_chain(b"", items)
+        assert tip == items[-1][0]
+
+        ids = store.resolve(tip, len(items))
+        assert ids == [bid for bid, _ in items]
+
+        got = store.get_many(ids)
+        assert b"".join(got[bid] for bid in ids) == want
+
+    def test_root_block_content_is_not_truncated(self, store):
+        """回归:根块父哈希为空,value 曾是 ``"" ‖ content``,读回来被切掉 32 字节。"""
+        first = b"x" * 64
+        rest = b"y" * 64
+        items = storage.text_blocks(first + rest, 64)
+        tip = store.put_chain(b"", items)
+        got = store.get_many(store.resolve(tip, 2))
+        assert got[items[0][0]] == first
+
+    def test_resolve_parents_returns_parent_of_first(self, store):
+        items, _ = _chain("a" * 300, 64)
+        tip = store.put_chain(b"", items)
+        # 从链尾走 N 步,拿到的永远是**最后 N 块**(前缀的尾巴)
+        ids, parent = store.resolve_parents(tip, 3)
+        assert ids == [bid for bid, _ in items[-3:]]
+        assert parent == items[-4][0]
+
+        ids2, parent2 = store.resolve_parents(tip, len(items))
+        assert parent2 == b""                     # 走到根:根没有父
+
+    def test_missing_middle_block_is_incomplete(self, store, client):
+        items, _ = _chain("b" * 400, 64)
+        tip = store.put_chain(b"", items)
+        client.delete(store._key(items[1][0]))
+        assert store.resolve(tip, len(items)) is None
+
+    def test_partial_length(self, store):
+        items, _ = _chain("c" * 400, 64)
+        tip = store.put_chain(b"", items)
+        assert store.resolve(tip, 2) == [items[-2][0], items[-1][0]]
+        assert store.resolve(tip, 0) == []
+        assert store.resolve(tip, len(items) + 1) is None   # 越过根 = 不完整
+
+    def test_ttl_is_refreshed_on_read(self, client):
+        st = storage.RedisChainStore(client, ttl=2, namespace="tailtest-ttl")
+        st.clear()
+        items, _ = _chain("d" * 200, 64)
+        tip = st.put_chain(b"", items)
+        time.sleep(1.5)
+        assert st.resolve(tip, len(items)) is not None    # 读一次续期
+        time.sleep(1.2)
+        # 若没续期,第 0 块这时已经过期(2.7s > 2s)
+        assert st.resolve(tip, len(items)) is not None
+        assert client.ttl(st._key(items[0][0])) > 0
+
+    def test_expired_chain_reads_as_miss(self, client):
+        st = storage.RedisChainStore(client, ttl=1, namespace="tailtest-exp")
+        st.clear()
+        items, _ = _chain("e" * 200, 64)
+        tip = st.put_chain(b"", items)
+        time.sleep(1.2)
+        assert st.resolve(tip, len(items)) is None
+
+
+class TestCachedChainStore:
+    def test_l1_absorbs_repeated_resolve(self, client):
+        """第二次 resolve 完全由 L1 服务:即使 L2 的数据没了也能走通。
+
+        这条专门盯住「回填时父哈希填的是空」那个 bug——填错了链在中间就断,
+        表现就是这里仍然需要回源,于是失败。
+        """
+        inner = storage.RedisChainStore(client, ttl=60, namespace="tailtest-l1")
+        inner.clear()
+        cached = storage.CachedChainStore(inner, capacity=1000)
+        items, want = _chain("f" * 600, 64)
+        tip = cached.put_chain(b"", items)
+        ids = cached.resolve(tip, len(items))
+        assert ids == [bid for bid, _ in items]
+
+        inner.clear()                         # L2 清空,只剩 L1
+        assert cached.resolve(tip, len(items)) == ids
+        got = cached.get_many(ids)
+        assert b"".join(got[i] for i in ids) == want
+
+    def test_l1_miss_falls_back_and_still_fills(self, client):
+        inner = storage.RedisChainStore(client, ttl=60, namespace="tailtest-l1b")
+        inner.clear()
+        cached = storage.CachedChainStore(inner, capacity=1000)
+        items, _ = _chain("g" * 600, 64)
+        tip = inner.put_chain(b"", items)      # 直接写进 L2,绕过 L1
+        ids = cached.resolve(tip, len(items))  # 首次:回源 + 回填
+        assert ids == [bid for bid, _ in items]
+        inner.clear()
+        assert cached.resolve(tip, len(items)) == ids   # 回填的链是完整的
+
+
+class TestFullPathOnRedis:
+    def test_gateway_roundtrip_over_redis(self, store):
+        rng = random.Random(1)
+        msgs = [{"role": "system", "content": "你是助手" + "细节" * 80}]
+        for i in range(4):
+            msgs.append({"role": "user", "content": f"问{i}:" + "描述" * 60})
+            msgs.append({"role": "assistant", "content": f"答{i}:" + "结论" * 90})
+        payload = {"model": "deepseek-chat", "messages": msgs}
+
+        from tail.transport.gateway import TailClient
+        client = TailClient(block_size=256)
+        assert roundtrip(payload, store, client) == payload
+        # 第二轮全命中:客户端只发不足一块的尾巴
+        before = sum(1 for _ in store._client.scan_iter(
+            match=store._ns + storage.KEY_PREFIX + "*"))
+        back = roundtrip(payload, store, client)
+        assert back == payload
+        after = sum(1 for _ in store._client.scan_iter(
+            match=store._ns + storage.KEY_PREFIX + "*"))
+        assert after == before, "同样的内容不该再写块"
+
+    def test_have_roundtrip_through_url_factory(self, client):
+        st = storage.make_store(_URL, ttl=60, cache_blocks=100)
+        assert isinstance(st, storage.CachedChainStore)
+        st.clear()
+        items, _ = _chain("h" * 300, 64)
+        tip = st.put_chain(b"", items)
+        assert st.resolve(tip, len(items)) == [bid for bid, _ in items]
+        st.clear()

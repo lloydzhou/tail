@@ -1,61 +1,31 @@
-"""客户端接入:把 openai SDK(或任意 httpx 客户端)的请求透明换成帧流。
+"""httpx / httpx2 传输适配:把 chat 请求的 JSON body 换成 v3 线缆。
 
-现有代码零改动
---------------
-::
+用法(现有代码只多一个参数)::
 
     import httpx2
-    from openai import OpenAI
     from tail.transport.client import TailTransport
 
-    client = OpenAI(
-        base_url="http://127.0.0.1:8765/v1",
-        api_key="sk-xxx",
-        http_client=httpx2.Client(transport=TailTransport()),
-    )
+    http = httpx2.Client(transport=TailTransport())
+    client = openai.OpenAI(http_client=http)
 
-    # 下面这行和没有 Tail 时完全一样
-    client.chat.completions.create(model="deepseek-chat", messages=messages)
+v3 做的事只有三件:
 
-异步同理,换成 ``AsyncOpenAI`` + ``httpx2.AsyncClient(transport=TailAsyncTransport())``。
+1. 请求方向:JSON body → (会话键, 前缀凭据) 两个头 + 尾部字节流。
+2. 响应方向:读 ``X-Tail-Have`` 记下服务端确认的前缀,供下一轮使用。
+3. 服务端说前缀失效(``X-Tail-Retransmit``)时,丢掉凭据、全量重发一次,
+   对上层完全透明。
 
-库版本说明:openai 3.x 依赖 ``httpx2``;openai 1.x 依赖 ``httpx``。两个库把
-请求对象传给 transport,所以本模块按请求所属的库自动选择内层 transport,
-两种都能用,不需要调用方关心。
-
-为什么不再 monkey-patch openai SDK
-----------------------------------
-旧实现 patch 了 ``SyncAPIClient.request`` 改写 ``options.json_data``、patch
-``httpx.Client.send`` 抓 ``X-Cache-*`` 响应头。那对应的是「body 仍是标准 JSON,
-只在头上做前缀协商」的旧协议。
-
-新协议把**整个 body 换成二进制帧流**,并且客户端要维护「已知块哈希集合」——
-这些在 openai SDK 的私有方法上改不动。
-
-``httpx2`` 的 ``transport`` 是公开扩展点:SDK 内部结构一行不碰,只替换"字节怎么
-发出去"这一段。比旧实现更稳,也不依赖 openai 的私有属性。
-
-它做什么
---------
-只对 ``/chat/completions`` 的 JSON 请求生效,其余请求(模型列表、文件上传、
-embedding……)原样透传:
-
-1. 读请求 body(此时已是 openai SDK 序列化好的 JSON);
-2. ``render`` 成文本 → 定长切块 → 查本地已知块集合 → 编成帧流;
-3. 把 ``Content-Type`` 换成 ``application/x-tail-v2``、去掉 ``Content-Length``
-   (body 变成流式,由 httpx 自动用 chunked 发);
-4. 内层 transport 真正发出;
-5. 若响应带 ``X-Tail-Retransmit: 1``(网关缺块),清空本地已知集合并**自动重发一次**
-   全量——对上层完全透明。
+**没有任何整包拷贝**:body 是渲染器产出的片段流,httpx 边收边发。
 """
 
 from __future__ import annotations
 
 import importlib
 import json
-from typing import Any, Dict, Iterator, Optional
+from typing import Any, Dict, Optional
 
-from .gateway import CONTENT_TYPE_BLOCKS, HEADER_RETRANSMIT, TailClient
+from .gateway import (CONTENT_TYPE_BLOCKS, HEADER_HAVE, HEADER_RETRANSMIT,
+                      HEADER_SESSION, TailClient)
 
 #: 只处理这个路径的请求。其余(embeddings / models / files…)直接透传。
 CHAT_PATH_MARKER = "/chat/completions"
@@ -69,21 +39,24 @@ def _is_chat_json_request(request: Any, marker: str) -> bool:
     return "json" in ctype.lower()
 
 
-def _rebuild(request: Any, content: Any, *, tail: bool) -> Any:
+def _rebuild(request: Any, content: Any, *, tail: bool,
+             extra: Optional[Dict[str, str]] = None) -> Any:
     """用新 body 重建请求对象,保留方法、URL、其余头。
 
     ``content`` 可以是 bytes,也可以是 ``Iterator[bytes]``(流式体)。
 
-    原 ``Content-Length`` 必须去掉:body 变成流式后长度未知,由 httpx 用
+    原 ``Content-Length`` 必须去掉:body 变成流式后长度未知,由 HTTP 库用
     ``Transfer-Encoding: chunked`` 发。
     """
     drop = {"content-length", "content-type", "transfer-encoding"}
     headers = [(k, v) for k, v in request.headers.raw
                if k.decode("latin-1").lower() not in drop]
-    if tail:
-        headers.append((b"content-type", CONTENT_TYPE_BLOCKS.encode("latin-1")))
-    else:
-        headers.append((b"content-type", b"application/json"))
+    headers.append((b"content-type",
+                    (CONTENT_TYPE_BLOCKS if tail else "application/json")
+                    .encode("latin-1")))
+    for name, value in (extra or {}).items():
+        if value:
+            headers.append((name.encode("latin-1"), value.encode("latin-1")))
     return type(request)(
         method=request.method,
         url=request.url,
@@ -94,7 +67,7 @@ def _rebuild(request: Any, content: Any, *, tail: bool) -> Any:
 
 
 class TailTransport:
-    """同步传输适配。可传给 ``httpx2.Client(transport=...)``
+    """同步传输适配。可传给 ``httpx.Client(transport=...)``
     或 ``openai.OpenAI(http_client=...)``。
 
     **不继承任何基类**:``httpx`` 与 ``httpx2`` 的 base class 不同,而传输层只被
@@ -115,7 +88,7 @@ class TailTransport:
 
     @property
     def client(self) -> TailClient:
-        """底层 :class:`TailClient`(可读 ``known_blocks`` 等统计)。"""
+        """底层 :class:`TailClient`(可读 ``sessions`` 等统计)。"""
         return self._client
 
     def handle_request(self, request: Any) -> Any:
@@ -132,7 +105,7 @@ class TailTransport:
 
         response = self._send(request, payload)
         if response.headers.get(HEADER_RETRANSMIT):
-            # 网关缺块(存储被清 / 重启 / 淘汰):清空本地已知集合,重发全量一次。
+            # 前缀失效(存储被清 / 重启 / 淘汰):丢掉凭据,全量重发一次。
             # 对调用方透明——它只看到一次正常的响应。
             self._client.invalidate()
             response.close()
@@ -165,10 +138,17 @@ class TailTransport:
         return inner
 
     def _send(self, request: Any, payload: Dict[str, Any]) -> Any:
-        # 流式:encoder 逐块产出,httpx 边收边发,不把整个 body 拼成一个大 bytes
-        body = self._client.iter_encode_request(payload)
-        return self._resolve_inner(request).handle_request(
-            _rebuild(request, body, tail=True))
+        prepared = self._client.prepare(payload)
+        headers = {
+            HEADER_SESSION: prepared.session.hex(),
+            HEADER_HAVE: (f"{prepared.have_len};{prepared.have_tip.hex()}"
+                          if prepared.have_len else ""),
+        }
+        response = self._resolve_inner(request).handle_request(
+            _rebuild(request, prepared.body, tail=True, extra=headers))
+        if not response.headers.get(HEADER_RETRANSMIT):
+            self._client.update_from_headers(prepared.session, response.headers)
+        return response
 
 
 class TailAsyncTransport:
@@ -180,7 +160,7 @@ class TailAsyncTransport:
                  inner: Any = None,
                  client: Optional[TailClient] = None,
                  chat_path_marker: str = CHAT_PATH_MARKER) -> None:
-        self._inner = inner              # None 时按请求所属库惰性创建
+        self._inner = inner
         self._client = client if client is not None else TailClient()
         self.chat_path_marker = chat_path_marker
         self._autoinner: Dict[str, Any] = {}
@@ -214,8 +194,6 @@ class TailAsyncTransport:
             if aclose is not None:
                 await aclose()
 
-    # -- 内部 -------------------------------------------------------------
-
     def _resolve_inner(self, request: Any) -> Any:
         if self._inner is not None:
             return self._inner
@@ -228,12 +206,14 @@ class TailAsyncTransport:
         return inner
 
     async def _send(self, request: Any, payload: Dict[str, Any]) -> Any:
-        return await self._resolve_inner(request).handle_async_request(
-            _rebuild(request, _aiter_bytes(self._client.iter_encode_request(payload)),
-                     tail=True))
-
-
-async def _aiter_bytes(chunks: Iterator[bytes]):
-    """把同步字节迭代器包成异步迭代器(httpx 异步流式请求体接受它)。"""
-    for chunk in chunks:
-        yield chunk
+        prepared = self._client.prepare(payload)
+        headers = {
+            HEADER_SESSION: prepared.session.hex(),
+            HEADER_HAVE: (f"{prepared.have_len};{prepared.have_tip.hex()}"
+                          if prepared.have_len else ""),
+        }
+        response = await self._resolve_inner(request).handle_async_request(
+            _rebuild(request, prepared.body, tail=True, extra=headers))
+        if not response.headers.get(HEADER_RETRANSMIT):
+            self._client.update_from_headers(prepared.session, response.headers)
+        return response

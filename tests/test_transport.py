@@ -1,9 +1,10 @@
-"""transport 层测试:分块、帧格式、渲染、编解码、存储、网关。
+"""transport 层测试:分块、渲染、前缀凭据、链式存储、网关。
 
 协议要点(详见 docs/TRANSPORT-PIPELINE.md):
-  - 渲染器 / 反渲染器 / 编码器 / 解码器 **全部是流式的**
-  - Content-Type 为 application/x-tail-v2
-  - 分块用 vLLM 式定长块 + 哈希链,流式切块必须与一次性结果完全一致
+  - 渲染 / 反渲染 / 切块 / 哈希写入 **全部是流式的**
+  - Content-Type 为 application/x-tail-v3
+  - 分块用 vLLM 式定长块 + 哈希链;**哈希的权威在网关**
+  - 客户端只做只读校验:确认「前 L 字节没变」,不发任何哈希
 """
 
 from __future__ import annotations
@@ -15,7 +16,7 @@ import random
 import pytest
 
 from tail.transport import chunking as ck
-from tail.transport import codec, frames, gateway as gw, render, storage
+from tail.transport import codec, gateway as gw, render, storage
 
 
 # ---------------------------------------------------------------------------
@@ -48,10 +49,6 @@ def make_payload(turns: int = 10, seed: int = 0) -> dict:
         msgs.append({"role": "assistant", "content": f"回答{i}:" + sent(rng, 50)})
     return {"model": "deepseek-chat", "messages": msgs, "temperature": 0.7}
 
-
-# ---------------------------------------------------------------------------
-# 分块(vLLM 定长块)
-# ---------------------------------------------------------------------------
 
 class TestChunking:
     def test_split_covers_input_exactly(self):
@@ -155,44 +152,7 @@ class TestBlockHasher:
 
 
 # ---------------------------------------------------------------------------
-# 帧格式
-# ---------------------------------------------------------------------------
-
-class TestFrames:
-    def test_roundtrip_mixed(self):
-        text = make_text().encode()
-        pairs = ck.blocked_to_blocks(text)[:5]
-        enc = [("new", pairs[0])] + [("ref", h) for h, _b in pairs[1:]]
-        assert frames.decode_frames(frames.encode_frames(enc)) == enc
-
-    def test_incremental_feed_arbitrary_boundaries(self):
-        text = os.urandom(20000)
-        enc = [("new", (h, b)) for h, b in ck.blocked_to_blocks(text)]
-        wire = frames.encode_frames(enc)
-        dec = frames.FrameDecoder()
-        got = []
-        for i in range(0, len(wire), 3):
-            got += list(dec.feed(wire[i:i + 3]))
-        assert got == enc and dec.eof_ok
-
-    def test_end_frame_required(self):
-        with pytest.raises(ValueError):
-            frames.decode_frames(frames.encode_ref(ck.block_hash(b"x")))
-
-    def test_ref_frame_is_17_bytes(self):
-        assert len(frames.encode_ref(ck.block_hash(b"x"))) == 17
-
-    def test_invalid_block_hash_length(self):
-        with pytest.raises(ValueError):
-            frames.encode_ref(b"short")
-
-    def test_bad_frame_type(self):
-        with pytest.raises(ValueError):
-            frames.decode_frames(b"\x09" + b"\x00" * 20)
-
-
-# ---------------------------------------------------------------------------
-# 渲染 / 反渲染(流式)
+# 渲染 / 反渲染
 # ---------------------------------------------------------------------------
 
 class TestRender:
@@ -385,191 +345,244 @@ class TestStreamingRender:
 # 编解码
 # ---------------------------------------------------------------------------
 
-class TestCodec:
-    def test_encode_decode_roundtrip(self):
-        text = make_text().encode()
-        enc = codec.Encoder()
-        wire = enc.encode(text)
-        src = codec.DictBlockSource()
-        dec = codec.Decoder(src, on_new_block=lambda b, c: src.put_many({b: c}))
-        out = b"".join(dec.feed(wire))
-        dec.finish()
-        assert out == text
+# ---------------------------------------------------------------------------
+# 前缀凭据:客户端自检 + 网关续链
+# ---------------------------------------------------------------------------
 
-    def test_stream_encode_matches_one_shot(self):
-        text = make_text().encode()
-        enc = codec.Encoder()
-        one = enc.encode(text)
-        enc2 = codec.Encoder()
-        streamed = b"".join(enc2.iter_encode([text[i:i + 100]
-                                              for i in range(0, len(text), 100)]))
-        assert streamed == one
+def _roundtrip(store, client, payload):
+    """走一遍完整的 v3 往返,并把服务端确认的前缀写回客户端。"""
+    prepared = client.prepare(payload)
+    body = list(prepared.body)
+    gateway = gw.TailGateway(store)
+    out, session = gateway.collect_payload(iter(body), prepared.have_len,
+                                           prepared.have_tip)
+    client.set_credential(prepared.session, session.prefix_len, session.tip)
+    return prepared, out, session, sum(map(len, body))
 
-    def test_second_request_sends_only_increment(self):
-        rng = random.Random(7)
-        enc = codec.Encoder()
-        text1 = make_text(seed=7, turns=400).encode()
-        enc.encode(text1)
-        text2 = text1 + sent(rng, 300).encode()
-        wire2 = enc.encode(text2)
-        assert len(wire2) < len(text2) * 0.1
 
-    def test_known_blocks_become_refs(self):
-        text = make_text().encode()
-        enc = codec.Encoder()
-        enc.encode(text)
-        assert all(k == "ref" for k, _ in frames.decode_frames(enc.encode(text)))
+class TestPrefixClient:
 
-    def test_cache_empty_still_works(self):
-        text = make_text().encode()
-        wire = codec.Encoder().encode(text)
-        dec = codec.Decoder(codec.NullBlockSource())
-        out = b"".join(dec.feed(wire))
-        dec.finish()
-        assert out == text and dec.ok
+    def test_cold_then_hit(self):
+        """同一份 payload 第二次只发不满一块的尾巴。"""
+        store, client = storage.MemoryChainStore(), gw.TailClient()
+        payload = make_payload(turns=8)
 
-    def test_missing_block_raises_and_records(self):
-        """缺块必须立刻抛,不能跳过继续解。
+        p1, out1, s1, wire1 = _roundtrip(store, client, payload)
+        assert p1.have_len == 0
+        assert out1["messages"] == payload["messages"]
+        assert s1.prefix_len > 0
 
-        跳过会产出带洞的文本:洞落在 UTF-8 多字节字符中间时后续片段首字节非法
-        (UnicodeDecodeError);洞落在 message 边界时拼出的 prompt 语义已变却仍是
-        合法 JSON,会被静默转发给上游白跑一次推理。
-        """
-        text = make_text().encode()
-        enc = codec.Encoder()
-        enc.encode(text)
-        dec = codec.Decoder(codec.NullBlockSource())
-        with pytest.raises(codec.MissingBlock):
-            list(dec.feed(enc.encode(text)))
-        assert dec.missing and not dec.ok
+        p2, out2, s2, wire2 = _roundtrip(store, client, payload)
+        assert p2.have_len == s1.prefix_len
+        assert out2["messages"] == payload["messages"]
+        assert wire2 < wire1 // 10, (wire1, wire2)
+        assert s2.hit_ratio > 0.9
 
-    def test_encoder_forget_triggers_resend(self):
-        text = make_text().encode()
-        enc = codec.Encoder()
-        wire1 = enc.encode(text)
-        enc.forget({bid for bid, _full in ck.blocked_hashes(text)})
-        assert enc.encode(text) == wire1
+    def test_append_only_extends_prefix(self):
+        """纯追加:前缀只增不减,线上只走新增部分。"""
+        store, client = storage.MemoryChainStore(), gw.TailClient()
+        payload = make_payload(turns=6)
+        _, _, s1, _ = _roundtrip(store, client, payload)
+        payload["messages"].append({"role": "user", "content": "追加的提问" * 40})
+        p2, out2, s2, _ = _roundtrip(store, client, payload)
+        assert p2.have_len == s1.prefix_len
+        assert out2["messages"] == payload["messages"]
+        assert s2.prefix_len > s1.prefix_len
+
+    def test_edit_middle_falls_back_to_full(self):
+        """改中间消息 → 前缀变了,客户端必须从 0 重发(否则静默拼错)。"""
+        store, client = storage.MemoryChainStore(), gw.TailClient()
+        payload = make_payload(turns=6)
+        _roundtrip(store, client, payload)
+        payload["messages"][3]["content"] = "被改掉的回答" * 50
+        prepared, out, session, wire = _roundtrip(store, client, payload)
+        assert prepared.have_len == 0          # 凭据作废
+        assert out["messages"] == payload["messages"]
+
+    def test_changed_param_breaks_prefix(self):
+        """顶层参数在正文最前面:改了它同样让前缀失效。"""
+        store, client = storage.MemoryChainStore(), gw.TailClient()
+        payload = make_payload(turns=6)
+        _roundtrip(store, client, payload)
+        payload["temperature"] = 0.1
+        prepared, out, session, _ = _roundtrip(store, client, payload)
+        assert prepared.have_len == 0
+
+    def test_session_key_is_content_addressed(self):
+        """会话键 = 首块哈希:同样的开头 → 同样的键,不依赖客户端发明 id。"""
+        a = gw.TailClient().prepare(make_payload(turns=3, seed=1))
+        b = gw.TailClient().prepare(make_payload(turns=3, seed=1))
+        c = gw.TailClient().prepare(make_payload(turns=3, seed=2))
+        assert a.session == b.session and a.session != c.session
+        assert len(a.session) == ck.BLOCK_ID_SIZE
+
+    def test_credentials_are_bounded(self):
+        """每会话只留有限个凭据(容忍并发响应乱序),不会无限涨。"""
+        client = gw.TailClient(max_credentials=2)
+        session = b"x" * 16
+        for i in range(10):
+            client.set_credential(session, 512 * (i + 1), bytes([i]) * 16)
+        assert len(client._encoder.credentials(session)) == 2
+
+    def test_invalidate_drops_credentials(self):
+        store, client = storage.MemoryChainStore(), gw.TailClient()
+        payload = make_payload(turns=4)
+        _roundtrip(store, client, payload)
+        assert client.sessions == 1
+        client.invalidate()
+        assert client.sessions == 0
+        prepared, _, _, _ = _roundtrip(store, client, payload)
+        assert prepared.have_len == 0
+
+    def test_stale_credential_raises_missing_prefix(self):
+        """存储被清空:网关必须抛错过,而不是拼出错前缀。"""
+        store, client = storage.MemoryChainStore(), gw.TailClient()
+        payload = make_payload(turns=6)
+        _, _, s1, _ = _roundtrip(store, client, payload)
+        store.clear()
+        prepared = client.prepare(payload)
+        assert prepared.have_len == s1.prefix_len
+        with pytest.raises(codec.MissingPrefix):
+            gw.TailGateway(store).collect_payload(
+                iter(prepared.body), prepared.have_len, prepared.have_tip)
 
 
 # ---------------------------------------------------------------------------
-# 存储
+# 链式存储
 # ---------------------------------------------------------------------------
 
-class TestStorage:
-    def test_memory_roundtrip(self):
-        text = make_text().encode()
-        st = storage.MemoryStorage()
-        assert st.put_text(text) > 0
-        # 存储只收满块,id 按 hash 链计算
-        ids = [bid for bid, full in ck.blocked_hashes(text) if full]
-        assert len(st.get_many(ids)) == len(ids)
+class TestChainStore:
 
-    def test_memory_lru_eviction(self):
-        st = storage.MemoryStorage(capacity=2)
-        st.put_many({b"a" * 16: b"1", b"b" * 16: b"2", b"c" * 16: b"3"})
-        assert len(st) == 2
-        assert st.get_many([b"a" * 16]) == {}
-        assert st.get_many([b"c" * 16]) == {b"c" * 16: b"3"}
+    def test_put_and_resolve(self):
+        store = storage.MemoryChainStore()
+        blocks = storage.text_blocks(b"a" * 512 + b"b" * 512, 512)
+        tip = store.put_chain(b"", blocks)
+        assert tip == blocks[-1][0]
+        ids = store.resolve(tip, 2)
+        assert ids == [blocks[0][0], blocks[1][0]]
+        assert store.get_many(ids)[blocks[1][0]] == b"b" * 512
 
-    def test_dbm_roundtrip_and_persist(self, tmp_path):
-        text = make_text().encode()
-        path = str(tmp_path / "blocks.db")
-        ids = [bid for bid, full in ck.blocked_hashes(text) if full]
-        with storage.DbmStorage(path) as st:
-            st.put_text(text)
-            assert len(st.get_many(ids)) == len(ids)
-        with storage.DbmStorage(path) as st:
-            assert len(st.get_many(ids)) == len(ids)
+    def test_resolve_returns_none_when_middle_missing(self):
+        """前缀必须完整可走:中间缺一块就是 miss,不能拼出洞。"""
+        store = storage.MemoryChainStore()
+        blocks = storage.text_blocks(b"a" * 512 + b"b" * 512 + b"c" * 512, 512)
+        tip = store.put_chain(b"", blocks)
+        store._data.pop(blocks[1][0], None)
+        assert store.resolve(tip, 3) is None
 
-    def test_make_storage(self, tmp_path):
-        assert isinstance(storage.make_storage(""), storage.MemoryStorage)
-        st = storage.make_storage(f"dbm:{tmp_path}/b.db")
-        assert isinstance(st, storage.DbmStorage)
-        st.close()
-        with pytest.raises(ValueError):
-            storage.make_storage("s3://bucket/key")
+    def test_resolve_partial_length(self):
+        store = storage.MemoryChainStore()
+        blocks = storage.text_blocks(b"a" * 512 * 3, 512)
+        tip = store.put_chain(b"", blocks)
+        assert store.resolve(tip, 1) == [blocks[-1][0]]
+
+    def test_capacity_eviction(self):
+        store = storage.MemoryChainStore(capacity=2)
+        blocks = storage.text_blocks(b"a" * 512 * 3, 512)
+        tip = store.put_chain(b"", blocks)
+        assert store.resolve(tip, 3) is None      # 头部被淘汰
+        assert store.resolve(tip, 2) is not None
+
+    def test_make_store_default(self):
+        assert isinstance(storage.make_store(""), storage.MemoryChainStore)
+
+    def test_cached_store_serves_from_l1(self):
+        """L1 命中时不该再问 L2(走链 1,600 跳的成本必须被吃掉)。"""
+        calls = {"resolve": 0, "get_many": 0}
+
+        class Spy(storage.MemoryChainStore):
+            def resolve(self, tip, n_blocks):
+                calls["resolve"] += 1
+                return super().resolve(tip, n_blocks)
+
+            def get_many(self, ids):
+                calls["get_many"] += 1
+                return super().get_many(ids)
+
+        inner = Spy()
+        store = storage.CachedChainStore(inner, capacity=1000)
+        blocks = storage.text_blocks(b"a" * 512 * 4, 512)
+        tip = store.put_chain(b"", blocks)
+        ids = store.resolve(tip, 4)
+        assert ids is not None
+        before = dict(calls)
+        assert store.resolve(tip, 4) == ids
+        assert calls == before, "L1 应当直接命中,不碰 inner"
+        assert store.get_many(ids)[ids[0]] is not None
 
 
 # ---------------------------------------------------------------------------
-# 网关
+# 网关协议层
 # ---------------------------------------------------------------------------
 
 class TestGateway:
-    def test_wants_blocks(self):
-        assert gw.TailGateway.wants_blocks("application/x-tail-v2")
-        assert gw.TailGateway.wants_blocks("application/x-tail-v2; charset=utf-8")
-        assert not gw.TailGateway.wants_blocks("application/json")
-        assert not gw.TailGateway.wants_blocks(None)
 
-    def test_full_roundtrip(self):
-        payload = make_payload(turns=20)
-        out = gw.roundtrip(payload, storage.MemoryStorage())
+    def test_wants_blocks(self):
+        assert gw.TailGateway.wants_blocks(gw.CONTENT_TYPE_BLOCKS)
+        assert not gw.TailGateway.wants_blocks("application/json")
+
+    def test_have_header_roundtrip(self):
+        tip = bytes(range(16))
+        assert gw.decode_have(gw.encode_have(1536, tip)) == (1536, tip)
+        assert gw.decode_have("") == (0, b"")
+        assert gw.decode_have("垃圾") == (0, b"")
+        assert gw.decode_have("1536;short") == (0, b"")
+
+    def test_session_header_roundtrip(self):
+        raw = bytes(range(16))
+        assert gw.decode_session(raw.hex()) == raw
+        assert gw.decode_session("zz") == b""
+        assert gw.decode_session(None) == b""
+
+    def test_full_roundtrip_keeps_content_and_params(self):
+        store = storage.MemoryChainStore()
+        payload = make_payload(turns=5)
+        out = gw.roundtrip(payload, store)
         assert out["messages"] == payload["messages"]
         assert out["model"] == payload["model"]
+        assert out["temperature"] == pytest.approx(payload["temperature"])
 
-    def test_session_output_is_valid_json(self):
-        payload = make_payload(turns=5)
-        st = storage.MemoryStorage()
-        wire = gw.TailClient().encode_request(payload)
-        pieces = list(gw.TailGateway(st).iter_payload_json([wire]))
-        assert json.loads(b"".join(pieces))["messages"] == payload["messages"]
+    def test_output_is_valid_json(self):
+        store = storage.MemoryChainStore()
+        client = gw.TailClient()
+        prepared = client.prepare(make_payload(turns=3))
+        raw = b"".join(gw.TailGateway(store).iter_payload_json(
+            prepared.body, prepared.have_len, prepared.have_tip))
+        assert json.loads(raw)["messages"]
 
-    def test_streaming_output_equals_buffered(self):
-        """流式 JSON 片段拼起来,与一次性结果完全一致。"""
-        payload = make_payload(turns=8)
-        st = storage.MemoryStorage()
-        wire = gw.TailClient().encode_request(payload)
-        streamed = b"".join(gw.TailGateway(st).iter_payload_json([wire]))
-        back, _ = gw.TailGateway(st).collect_payload([wire])
-        assert json.loads(streamed) == back
+    def test_streaming_equals_buffered(self):
+        """逐片喂与一次性喂必须产出相同的 JSON。"""
+        store = storage.MemoryChainStore()
+        payload = make_payload(turns=4)
+        client = gw.TailClient()
+        prepared = client.prepare(payload)
+        body = list(prepared.body)
+        gateway = gw.TailGateway(store)
+        a = b"".join(gateway.iter_payload_json(iter(body), 0, b""))
+        pieces = [bytes([b]) for chunk in body for b in chunk]
+        b = b"".join(gateway.iter_payload_json(iter(pieces), 0, b""))
+        assert json.loads(a) == json.loads(b)
 
     def test_turn_by_turn_volume_decreases(self):
-        rng = random.Random(11)
-        msgs = [{"role": "system", "content": sent(rng, 200)}]
-        st = storage.MemoryStorage()
-        client = gw.TailClient()
-        sizes, ctx = [], []
-        for turn in range(1, 21):
-            msgs.append({"role": "user", "content": f"问题{turn}:" + sent(rng, 40)})
-            payload = {"model": "x", "messages": msgs}
-            wire = client.encode_request(payload)
-            session = gw.TailGateway(st).iter_payload_json([wire])
-            assert json.loads(b"".join(session))["messages"] == msgs
-            sizes.append(len(wire))
-            ctx.append(sum(len(m["content"]) for m in msgs))
-            msgs.append({"role": "assistant", "content": f"回答{turn}:" + sent(rng, 40)})
-        recent = sum(sizes[10:]) / len(sizes[10:])
-        assert recent < ctx[-1] * 0.4, f"后半段 {recent:.0f}B vs 上下文 {ctx[-1]}B"
-
-    def test_storage_unavailable_degrades(self):
-        payload = make_payload(turns=5)
-        st = storage.MemoryStorage()
-        client = gw.TailClient()
-        client.encode_request(payload)
-        wire = client.encode_request(payload)
-        st.clear()
-        with pytest.raises(codec.MissingBlock):
-            gw.TailGateway(st).collect_payload([wire])
-
-    def test_client_invalidate_after_degrade(self):
-        payload = make_payload(turns=5)
-        st = storage.MemoryStorage()
-        client = gw.TailClient()
-        client.encode_request(payload)
-        client.invalidate()
-        assert client.known_blocks == 0
-        out, session = gw.TailGateway(st).collect_payload(
-            [client.encode_request(payload)])
-        assert out["messages"] == payload["messages"]
-        assert not session.missing
+        store, client = storage.MemoryChainStore(), gw.TailClient()
+        payload = make_payload(turns=4)
+        volumes = []
+        for i in range(6):
+            if i:
+                payload["messages"].append(
+                    {"role": "user", "content": f"第{i}轮问题" * 40})
+                payload["messages"].append(
+                    {"role": "assistant", "content": f"第{i}轮回答" * 40})
+            _, _, _, wire = _roundtrip(store, client, payload)
+            volumes.append(wire)
+        # 每轮新增两条消息(约 1.2 KB),线上体积应稳定在新增量附近
+        assert volumes[-1] < volumes[0] / 3, volumes
+        assert volumes[-1] < 2000, volumes
 
     def test_hit_ratio(self):
-        payload = make_payload(turns=6)
-        st = storage.MemoryStorage()
-        client = gw.TailClient()
-        cold = client.encode_request(payload)
-        gw.TailGateway(st).collect_payload([cold])      # 冷启动:先让网关存下块
-        _, session = gw.TailGateway(st).collect_payload(
-            [client.encode_request(payload)])
-        assert session.hit_ratio == 1.0
-        assert session.new_block_count == 0
+        store, client = storage.MemoryChainStore(), gw.TailClient()
+        payload = make_payload(turns=5)
+        _, _, s1, _ = _roundtrip(store, client, payload)
+        _, _, s2, _ = _roundtrip(store, client, payload)
+        assert s1.hit_ratio < 0.01
+        assert s2.hit_ratio > 0.9

@@ -1,10 +1,10 @@
-"""客户端接入层测试:``TailTransport`` 让 openai SDK 零改动接入帧流协议。
+"""客户端接入层测试:``TailTransport`` 让 openai SDK 零改动接入 v3 线缆。
 
 三层验证:
 
-1. **单元** —— 用假内层 transport 捕获请求,确认 chat 请求被换成帧流、
-   其他请求原样透传、缺块时自动重发。
-2. **集成** —— 帧流能被网关解码还原成原 payload。
+1. **单元** —— 用假内层 transport(背后是真网关 + 真存储)捕获请求,确认
+   chat 请求被换成「请求头 + 尾部字节」、其他请求原样透传、前缀失效时自动重发。
+2. **集成** —— 尾部字节经网关还原成原 payload。
 3. **真实 SDK** —— 装了 ``openai`` 时用真 SDK 跑一轮(未装则跳过)。
 """
 
@@ -14,27 +14,52 @@ import json
 
 import pytest
 
-from tail.transport import codec, frames, gateway as gw, render
+from tail.transport import codec, gateway as gw, storage
 from tail.transport.client import TailAsyncTransport, TailTransport
 
 httpx = pytest.importorskip("httpx2")
 
 
 # ---------------------------------------------------------------------------
-# 测试用内层 transport:不发网络,只记录请求并回一个假响应
+# 假内层 transport:背后是**真网关 + 真存储**,所以响应头里的凭据是真的
 # ---------------------------------------------------------------------------
 
 class _FakeInner:
-    def __init__(self, extra_headers: dict | None = None) -> None:
+    def __init__(self, store=None) -> None:
+        self.store = store if store is not None else storage.MemoryChainStore()
         self.requests = []
-        self._extra = extra_headers or {}
+        self.responses = []
 
     def handle_request(self, request):
         body = b"".join(request.stream)
         self.requests.append((request, body))
-        return httpx.Response(
-            200, json={"ok": True},
-            headers={"x-tail-version": "2", **self._extra})
+        if request.headers.get("content-type") != gw.CONTENT_TYPE_BLOCKS:
+            # 透传路径:不做任何解析
+            return httpx.Response(200, json={"ok": True, "passthrough": True})
+        have_len, have_tip = gw.decode_have(request.headers.get(gw.HEADER_HAVE))
+        gateway = gw.TailGateway(self.store)
+        try:
+            session = gateway.iter_payload_json(iter([body]), have_len, have_tip)
+            payload = json.loads(b"".join(session))
+            headers = {
+                gw.HEADER_VERSION: gw.TAIL_VERSION,
+                gw.HEADER_STATUS: session.status,
+                gw.HEADER_HIT: f"{session.hit_ratio:.3f}",
+                gw.HEADER_HAVE: session.have_header(),
+            }
+            status = 200
+            content = {"id": "chatcmpl-test", "object": "chat.completion",
+                       "created": 0, "model": payload["model"],
+                       "choices": [{"index": 0, "finish_reason": "stop",
+                                    "message": {"role": "assistant",
+                                                "content": "ok"}}]}
+        except codec.MissingPrefix:
+            headers = {gw.HEADER_VERSION: gw.TAIL_VERSION,
+                       gw.HEADER_RETRANSMIT: "1"}
+            status, content = 409, {"error": "retransmit"}
+        response = httpx.Response(status, json=content, headers=headers)
+        self.responses.append(response)
+        return response
 
     def close(self) -> None:
         pass
@@ -49,17 +74,12 @@ def _chat_request(payload: dict):
         content=json.dumps(payload, ensure_ascii=False).encode())
 
 
-def _decode_wire(wire: bytes, store=None):
-    """帧流 → payload,用真实解码器。
-
-    引用帧只能对着**同一份存储**解——网关解码时会把新块写进去
-    (``TailGateway`` 的 ``on_new_block``),所以连续两轮复用同一个 store
-    就等价于真实的「客户端两轮 + 网关持续在线」场景。
-    """
-    from tail.transport import storage as st
-    store = store if store is not None else st.MemoryStorage()
-    out, _session = gw.TailGateway(store).collect_payload([wire])
-    return out, store
+def _payload(turns: int = 6) -> dict:
+    msgs = [{"role": "system", "content": "你是严谨的助手。" * 60}]
+    for i in range(turns):
+        msgs.append({"role": "user", "content": f"第{i}问：" + "描述上下文" * 60})
+        msgs.append({"role": "assistant", "content": f"第{i}答：" + "给出结论" * 80})
+    return {"model": "deepseek-chat", "temperature": 0.7, "messages": msgs}
 
 
 # ---------------------------------------------------------------------------
@@ -67,225 +87,118 @@ def _decode_wire(wire: bytes, store=None):
 # ---------------------------------------------------------------------------
 
 class TestTailTransport:
-    def test_chat_request_is_converted_to_frames(self):
-        payload = {"model": "deepseek-chat",
-                   "messages": [{"role": "user", "content": "你好"}]}
-        inner = _FakeInner()
-        TailTransport(inner=inner).handle_request(_chat_request(payload))
 
+    def test_chat_request_is_converted_to_v3_wire(self):
+        inner = _FakeInner()
+        transport = TailTransport(inner=inner)
+        response = transport.handle_request(_chat_request(_payload()))
+
+        assert response.status_code == 200
         request, body = inner.requests[-1]
-        # Content-Type 换成帧流,Content-Length 必须去掉(体变成流式)
         assert request.headers["content-type"] == gw.CONTENT_TYPE_BLOCKS
-        assert "content-length" not in request.headers
-        # 首个字节是帧类型标记,不是 '{'
-        assert body[0] in (frames.FRAME_REF, frames.FRAME_NEW)
-        # 能还原成原 payload
-        out, _ = _decode_wire(body)
-        assert out == payload
+        assert len(request.headers[gw.HEADER_SESSION]) == 32
+        assert gw.HEADER_HAVE not in request.headers      # 冷启动没有凭据
+        assert body.startswith(b"<|model|>")             # 发的是渲染文本,不是 JSON
+        assert response.headers[gw.HEADER_HAVE]
 
     def test_non_chat_request_passes_through(self):
         inner = _FakeInner()
-        req = httpx.Request("POST", "http://tail.test/v1/embeddings",
-                            headers={"content-type": "application/json"},
-                            content=b'{"input":"x"}')
-        TailTransport(inner=inner).handle_request(req)
-
-        request, body = inner.requests[-1]
-        assert body == b'{"input":"x"}'
-        assert request.headers["content-type"] == "application/json"
+        transport = TailTransport(inner=inner)
+        request = httpx.Request("POST", "http://tail.test/v1/embeddings",
+                                json={"input": "x"})
+        transport.handle_request(request)
+        _, body = inner.requests[-1]
+        assert json.loads(body) == {"input": "x"}
 
     def test_invalid_json_is_not_guessed(self):
-        """body 不是合法 JSON 时原样发出,不能猜。"""
         inner = _FakeInner()
-        req = httpx.Request("POST", "http://tail.test/v1/chat/completions",
-                            headers={"content-type": "application/json"},
-                            content=b"not json at all")
-        TailTransport(inner=inner).handle_request(req)
-        _request, body = inner.requests[-1]
-        assert body == b"not json at all"
+        transport = TailTransport(inner=inner)
+        request = httpx.Request(
+            "POST", "http://tail.test/v1/chat/completions",
+            headers={"content-type": "application/json"}, content=b"{not json")
+        transport.handle_request(request)
+        _, body = inner.requests[-1]
+        assert body == b"{not json"
+
+    def test_second_request_reuses_prefix(self):
+        inner = _FakeInner()
+        transport = TailTransport(inner=inner)
+        payload = _payload()
+        transport.handle_request(_chat_request(payload))
+        transport.handle_request(_chat_request(payload))
+
+        (r1, b1), (r2, b2) = inner.requests[-2], inner.requests[-1]
+        assert gw.HEADER_HAVE not in r1.headers
+        assert r2.headers[gw.HEADER_HAVE]                # 第二轮带上凭据
+        assert len(b2) < len(b1) // 5, (len(b1), len(b2))
 
     def test_retransmit_triggers_full_resend(self):
-        """响应带 X-Tail-Retransmit 时清空本地已知集合、自动重发一次。"""
-        payload = {"model": "m",
-                   "messages": [{"role": "user", "content": "x" * 2000}]}
-        inner = _FakeInner(extra_headers={gw.HEADER_RETRANSMIT: "1"})
-        transport = TailTransport(inner=inner)
-
-        transport.handle_request(_chat_request(payload))
-        # 两次尝试:首次带引用帧(第二块起),重发时全量新块
-        assert len(inner.requests) == 2
-        second_body = inner.requests[1][1]
-        out, _ = _decode_wire(second_body)
-        assert out == payload
-        # 重发后不再有引用帧(已知集合已被 invalidate)
-        decoded = list(frames.FrameDecoder().feed(second_body))
-        assert all(kind == "new" for kind, _ in decoded if kind != "end")
-
-    def test_second_request_reuses_blocks(self):
-        """第二轮同样的前缀只发引用帧,线上体积显著变小。"""
-        payload = {"model": "m",
-                   "messages": [{"role": "user", "content": "y" * 3000}]}
         inner = _FakeInner()
         transport = TailTransport(inner=inner)
+        payload = _payload()
+        transport.handle_request(_chat_request(payload))     # 建立凭据
+        inner.store.clear()                                  # 网关存储被清
+
+        response = transport.handle_request(_chat_request(payload))
+        assert response.status_code == 200                   # 上层只看到成功
+        first, second = inner.requests[-2], inner.requests[-1]
+        assert gw.HEADER_HAVE in first[0].headers            # 第一次带旧凭据
+        assert gw.HEADER_HAVE not in second[0].headers       # 重发时凭据已丢
+        assert transport.client.sessions == 1                # 重建了凭据
+
+    def test_transport_keeps_no_body_copy(self):
+        """客户端不留正文副本:本地状态只有每会话的 (L, tip)。"""
+        inner = _FakeInner()
+        transport = TailTransport(inner=inner)
+        payload = _payload(turns=8)
         transport.handle_request(_chat_request(payload))
-        first, store = _decode_wire(inner.requests[-1][1])
-
         transport.handle_request(_chat_request(payload))
-        second, _ = _decode_wire(inner.requests[-1][1], store)
 
-        assert first == payload and second == payload
-        # 第二轮明显更小:首轮全是新块,次轮只剩引用 + 结尾
-        assert len(inner.requests[-1][1]) < len(inner.requests[0][1])
+        client = transport.client
+        assert client.sessions == 1
+        # 8+16 = 24 字节/会话;整份上下文有几十 KB,差三个数量级
+        assert client.credential_bytes <= 24 * 4
 
 
-# ---------------------------------------------------------------------------
-# 「本地只记哈希、不存内容」这条性质
-# ---------------------------------------------------------------------------
+class TestAsyncTransport:
 
-class TestLocalKnownSet:
-    """客户端的本地状态必须只是块哈希集合,不能留正文副本。"""
+    def test_async_roundtrip(self):
+        import asyncio
 
-    def test_known_set_holds_hashes_only(self):
-        from tail.transport import chunking
+        class _AsyncInner(_FakeInner):
+            async def handle_async_request(self, request):
+                return self.handle_request(request)
 
-        client = gw.TailClient()
-        payload = {"model": "m",
-                   "messages": [{"role": "user", "content": "z" * 10_000}]}
-        encoded = client.encode_request(payload)
+            async def aclose(self):
+                pass
 
-        known = client._encoder._known          # 内部集合,直接验证元素形态
-        assert known, "编码后应记下已发送的块"
-        # 每一项必须是定长块 id,而不是内容
-        assert all(len(bid) == chunking.BLOCK_ID_SIZE for bid in known)
-        # 块 id 是二进制哈希,不含正文
-        assert not any(b"zzzz" in bid for bid in known)
-        # 本地状态量与线上体积同阶,不随正文大小膨胀
-        assert len(known) * chunking.BLOCK_ID_SIZE < len(encoded)
+        inner = _AsyncInner()
+        transport = TailAsyncTransport(inner=inner)
+        payload = _payload(turns=3)
 
-    def test_reusing_client_is_what_makes_it_cheap(self):
-        """复用同一个 client 才有缓存;每轮新建等于永远冷启动。"""
-        payload = {"model": "m",
-                   "messages": [{"role": "user", "content": "q" * 6000}]}
+        async def run():
+            request = _chat_request(payload)
+            r1 = await transport.handle_async_request(request)
+            r2 = await transport.handle_async_request(_chat_request(payload))
+            return r1, r2
 
-        reused = gw.TailClient()
-        cold_then_warm = [len(reused.encode_request(payload)) for _ in range(2)]
-        assert cold_then_warm[1] < cold_then_warm[0] / 2
-
-        fresh_total = sum(len(gw.TailClient().encode_request(payload))
-                          for _ in range(2))
-        # 不复用 = 两次都是冷启动体量
-        assert fresh_total > cold_then_warm[0] + cold_then_warm[1]
-
-    def test_prefix_shape_reuse(self):
-        """复用是前缀形状的:往中间插一条消息,后面全部失效。"""
-        head = [{"role": "system", "content": "s" * 2000}]
-        client = gw.TailClient()
-        base = client.encode_request(
-            {"model": "m", "messages": head + [{"role": "user", "content": "a" * 2000}]})
-
-        # 纯追加:几乎全命中
-        appended = client.encode_request(
-            {"model": "m", "messages": head
-             + [{"role": "user", "content": "a" * 2000},
-                {"role": "assistant", "content": "b" * 50}]})
-        # 插在中间:前缀断裂,后续块哈希全变
-        inserted = client.encode_request(
-            {"model": "m", "messages": [head[0],
-                                        {"role": "user", "content": "X"},
-                                        {"role": "user", "content": "a" * 2000}]})
-
-        assert len(appended) < len(base)          # 追加几乎免费
-        assert len(inserted) > len(appended)      # 中间插入代价高
+        r1, r2 = asyncio.run(run())
+        assert r1.status_code == 200 and r2.status_code == 200
+        assert len(inner.requests) == 2
 
 
 # ---------------------------------------------------------------------------
 # 真实 openai SDK
 # ---------------------------------------------------------------------------
 
-openai = pytest.importorskip("openai")
-
-
 class TestWithRealOpenAISDK:
-    """用真实 ``openai.OpenAI`` + 真实 HTTP 端口跑,验证零改动接入。"""
 
     def test_openai_sdk_roundtrip(self):
-        import socket
-        import threading
-        import time
-
-        import uvicorn
-
-        from tail import serve
-        from tail.transport import storage
-        from tests.mock_backend import build_backend_app
-
-        def free_port() -> int:
-            s = socket.socket()
-            s.bind(("127.0.0.1", 0))
-            port = s.getsockname()[1]
-            s.close()
-            return port
-
-        backend = build_backend_app()
-        backend_port = free_port()
-        threading.Thread(
-            target=uvicorn.Server(uvicorn.Config(
-                backend, host="127.0.0.1", port=backend_port,
-                log_level="error")).run, daemon=True).start()
-
-        gateway_port = free_port()
-        app = serve.build_app(f"http://127.0.0.1:{backend_port}",
-                             storage.MemoryStorage())
-        threading.Thread(
-            target=uvicorn.Server(uvicorn.Config(
-                app, host="127.0.0.1", port=gateway_port,
-                log_level="error")).run, daemon=True).start()
-
-        # 等端口起来
-        last_headers: dict = {}
-
-        def on_response(resp):
-            last_headers.clear()
-            last_headers.update(resp.headers)
-
-        # openai 3.x 用 httpx2;装不上就用 httpx(两者接口一致)
-        try:
-            import httpx2 as sdk_http
-        except ImportError:                       # pragma: no cover
-            sdk_http = httpx
-
+        openai = pytest.importorskip("openai")
         sdk_client = openai.OpenAI(
-            base_url=f"http://127.0.0.1:{gateway_port}/v1",
-            api_key="sk-test",
-            http_client=sdk_http.Client(
-                transport=TailTransport(),
-                event_hooks={"response": [on_response]}),
-        )
-
-        # 等网关可用
-        for _ in range(200):
-            try:
-                sdk_http.get(f"http://127.0.0.1:{gateway_port}/v1/models",
-                             timeout=0.5)
-                break
-            except Exception:                  # noqa: BLE001
-                time.sleep(0.05)
-        else:                                  # pragma: no cover
-            pytest.skip("网关未能启动")
-
-        messages = [{"role": "system", "content": "你是助手。"},
-                    {"role": "user", "content": "第一轮问题"}]
-        sent_snapshots = []
-        for turn in range(1, 3):
-            sent_snapshots.append([dict(m) for m in messages])
-            result = sdk_client.chat.completions.create(
-                model="deepseek-chat", messages=messages)
-            reply = result.choices[0].message.content
-            messages.append({"role": "assistant", "content": reply})
-            messages.append({"role": "user", "content": f"第{turn + 1}轮问题"})
-
-        # 真的走了帧流协议(而不是悄悄退回 JSON)
-        assert last_headers.get("x-tail-version") == gw.TAIL_VERSION
-        # 上游收到的 messages 与客户端实际发出的那一份完全一致
-        got = backend.state.received[-1]["messages"]
-        assert got == sent_snapshots[-1]
+            api_key="sk-test", base_url="http://tail.test/v1",
+            http_client=httpx.Client(transport=TailTransport(inner=_FakeInner())))
+        payload = _payload(turns=2)
+        completion = sdk_client.chat.completions.create(
+            model=payload["model"], messages=payload["messages"])
+        assert completion.choices[0].message.content == "ok"

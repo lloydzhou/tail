@@ -1,12 +1,14 @@
-"""网关服务端(FastAPI/ASGI):接收帧流,还原成 JSON,转发给上游。
+"""网关服务端(FastAPI/ASGI):收「前缀凭据 + 尾部字节」,还原成标准 JSON 转发给上游。
 
 启动::
 
-    python -m tail.serve --backend https://api.deepseek.com --dbm ./blocks.db
+    python -m tail.serve --backend https://api.deepseek.com \
+        --redis redis://127.0.0.1:6379/0 --ttl 1800
 
-客户端把 ``POST /v1/chat/completions`` 的 body 换成帧流、``Content-Type`` 设为
-``application/x-tail-v2`` 即可。响应(SSE 或 JSON)原样透传给客户端,
-客户端不感知变化。
+客户端把 ``POST /v1/chat/completions`` 的 ``Content-Type`` 设为
+``application/x-tail-v3``,body 只放「服务端还没有的那段文本」,凭据放
+``X-Tail-Have``。响应(SSE 或 JSON)原样透传给客户端,客户端不感知变化;
+但响应头里会多一个下一轮的 ``X-Tail-Have``。
 
 也接受普通 ``application/json`` 请求,原样转发——便于灰度对比和排障。
 """
@@ -15,11 +17,9 @@ from __future__ import annotations
 
 import argparse
 import asyncio
-import json
 import queue
-import os
 from concurrent.futures import ThreadPoolExecutor
-from typing import Any, AsyncIterator, Dict, Iterator, Optional
+from typing import Optional
 
 import httpx2 as httpx
 from contextlib import asynccontextmanager
@@ -30,7 +30,7 @@ from fastapi.responses import Response, StreamingResponse
 from .transport import codec as tail_codec
 from .transport import gateway as gw
 from .transport import render
-from .transport.storage import make_storage
+from .transport.storage import make_store
 
 
 def build_app(backend: str,
@@ -49,7 +49,7 @@ def build_app(backend: str,
         await app.state.client.aclose()
 
     app = FastAPI(title="Tail Gateway", lifespan=lifespan)
-    app.state.storage = storage if storage is not None else make_storage("")
+    app.state.storage = storage if storage is not None else make_store("")
     app.state.gateway = gw.TailGateway(app.state.storage)
     app.state.backend = backend.rstrip("/")
     app.state.client = httpx.AsyncClient(timeout=timeout)
@@ -97,24 +97,25 @@ async def _handle(request: Request, path: str, app: FastAPI):
         upstream = await client.send(req, stream=True)
         return _respond(upstream, "passthrough", None)
 
-    # ---- 帧流路径 ----
-    # **全程流式**:body 片段一到达就喂给解码器,解码器边解边产出 message,
+    # ---- v3 路径:凭据 + 尾部字节 ----
+    # **全程流式**:body 片段一到达就喂给前缀读取器,它边解边产出 message,
     # JSON 片段边生成边交给 httpx 发给上游。
     #
-    # 不能先 ``await request.body()`` 把整包收完——那样整份请求体already
-    # 躺在内存里,后面的"流式"只是把一个大包切成多个小包发,上游仍要等
-    # 最后一字节到齐才开始处理,完全没有意义。
+    # 不能先 ``await request.body()`` 把整包收完——那样整份请求体已经躺在内存里,
+    # 后面的"流式"只是把一个大包切成多个小包发,上游仍要等最后一字节到齐
+    # 才开始处理,完全没有意义。
     #
     # 内存峰值只与「单个块/单条 message」成正比,与请求体总大小无关。
+    have_len, have_tip = gw.decode_have(request.headers.get(gw.HEADER_HAVE))
     body = _AsyncToSyncBody(request)
     body.start()                      # 在事件循环线程里启动后台泵
-    session = gateway.iter_payload_json(body)
+    session = gateway.iter_payload_json(body, have_len, have_tip)
     req = client.build_request("POST", backend + path,
                                content=_AsyncJsonStream(session),
                                headers=upstream_headers)
     try:
         upstream = await client.send(req, stream=True)
-    except tail_codec.MissingBlock:
+    except tail_codec.MissingPrefix:
         # 缺块:立刻**中止**这次上游请求,让客户端重发全文。
         #
         # 不能「跳过缺块照常转发、再靠 X-Tail-Retransmit 补救」:
@@ -127,7 +128,6 @@ async def _handle(request: Request, path: str, app: FastAPI):
             gw.HEADER_VERSION: gw.TAIL_VERSION,
             gw.HEADER_STATUS: gw.CACHE_DEGRADED,
             gw.HEADER_RETRANSMIT: "1",
-            gw.HEADER_HIT: f"{session.hit_ratio:.3f}",
         })
     finally:
         # 请求体可能没被消费完(缺块中止 / 上游提前响应),停掉后台泵,
@@ -282,9 +282,8 @@ def _respond(upstream: httpx.Response, status: Optional[str],
     resp_headers[gw.HEADER_VERSION] = gw.TAIL_VERSION
     if session is not None:
         resp_headers[gw.HEADER_HIT] = f"{session.hit_ratio:.3f}"
-        # 缺块不会走到这里:它在解码时就被抛出,由 _handle 直接回 409。
-        # 所以这里不再有 ``session.missing`` 的分支(以前那个分支永不触发,
-        # 因为 missing 是在生成器结束时才赋值的,而缺块会先抛异常)。
+        # 下一轮的凭据:服务端是权威。客户端只读这个头,自己不算前缀。
+        resp_headers[gw.HEADER_HAVE] = session.have_header()
     return StreamingResponse(
         _relay(upstream),
         status_code=upstream.status_code,
@@ -309,23 +308,24 @@ async def _relay(upstream: httpx.Response):
 def main(argv: Optional[list] = None) -> None:
     parser = argparse.ArgumentParser(
         prog="python -m tail.serve",
-        description="Tail 网关:接收帧流,还原成 JSON,转发给上游推理服务",
+        description="Tail 网关:收前缀凭据 + 尾部字节,还原成标准 OpenAI JSON 转发给上游",
     )
     parser.add_argument("--backend", required=True,
                         help="上游 base URL,例如 https://api.deepseek.com")
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=8765)
-    parser.add_argument("--dbm", default="",
-                        help="块存储路径(不填用进程内内存存储,重启即丢)")
     parser.add_argument("--redis", default="",
-                        help="Redis URL,例如 redis://127.0.0.1:6379/0")
-    parser.add_argument("--ttl", type=int, default=0,
-                        help="块过期秒数(0 表示交给存储自身淘汰策略)")
+                        help="Redis URL,例如 redis://127.0.0.1:6379/0;"
+                             "不填用进程内存储(重启即丢,只适合开发)")
+    parser.add_argument("--ttl", type=int, default=1800,
+                        help="块过期秒数(默认 1800;读前缀时整条续期)")
+    parser.add_argument("--cache-blocks", type=int, default=20_000,
+                        help="进程内 L1 缓存的块数(0 表示不用 L1,直接打 Redis)")
     parser.add_argument("--log-level", default="info")
     args = parser.parse_args(argv)
 
-    storage = make_storage(args.redis or (f"dbm:{args.dbm}" if args.dbm else ""),
-                           ttl=args.ttl or None)
+    storage = make_store(args.redis, ttl=args.ttl or None,
+                         cache_blocks=args.cache_blocks)
     app = build_app(args.backend, storage)
     import uvicorn
     uvicorn.run(app, host=args.host, port=args.port, log_level=args.log_level)
