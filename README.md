@@ -378,11 +378,69 @@ provider 的 `url=` 还是普通的 chat completions 地址（`…/v1`），`tai
 | 合计 | **0.85 MB** | **0.13 MB** | **6.4x** |
 
 第 1 轮是全量（冷启动），之后每轮只上行「新增的那一轮」；两条路到达推理服务的
-messages 逐轮一致（保真校验）。复跑：
+messages 逐轮一致（保真校验）。
+
+**但纯追加是最理想的情况。** 真实 agent 还会 compact、回退分支、中途加工具、开多个
+会话——这些都会让前缀失效。所以真正取数要走 `tools/realworld.py`：它生成的轨迹里
+带这些事件，并且中间那条链路**按真实上行带宽限速**，于是上表里的「字节」直接变成
+「时间」。
+
+同一段 20 轮轨迹（2 个会话、40 KB 系统提示、每轮约 24 KB），在 25 Mbps 上行下：
+
+| 事件 | 轮数 | plain 上行 | tail 上行 | plain 上传 | tail 上传 | 省 |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| append（纯追加） | 16 | 3.27 MB | 0.69 MB | 1,337 ms | 253 ms | **4.7x** |
+| branch（回退分支） | 2 | 0.37 MB | 0.23 MB | 153 ms | 90 ms | 1.7x |
+| new_tools（加工具） | 1 | 0.18 MB | 0.18 MB | 73 ms | 74 ms | 1.0x |
+| compact（压缩历史） | 1 | 0.12 MB | 0.12 MB | 49 ms | 50 ms | 1.0x |
+| **合计** | 20 | **3.85 MB** | **1.18 MB** | **1,612 ms** | **466 ms** | **3.3x** |
+
+这张表最该看的不是 3.3x，而是**最后两行的 1.0x**：compact 和历史重排是**结构上**
+无法省的——前缀变了就是变了，只能整传一次。所以：
+
+- 省的是「对话在增长的绝大多数轮」——这也是 agent 的真实形态（一次 turn 跑半天、
+  几十轮工具调用）；
+- compact 那几轮的省是**严格 0**，不要把它算进平均收益；
+- 带宽越窄，省的绝对时间越多：同一轨迹在 10 Mbps 下，plain 3.95 s / tail 0.90 s
+  （省 3.05 s），而且**带宽降 2.5 倍，plain 上传耗时正好涨 2.45 倍**——这交叉验证了
+  限速确实在测真实传输时间，不是空转计时。
+
+上下文越大，这个差越明显：另一段 12 轮轨迹从 177 KB 长到 505 KB，25 Mbps 下
+
+| 轮 | 事件 | JSON | plain 上传 | tail 上传 |
+| ---: | --- | ---: | ---: | ---: |
+| 1 | append | 177.8 KB | 73.6 ms | 73.1 ms |
+| 4 | append | 341.0 KB | 138.5 ms | 20.0 ms |
+| 6 | append | 450.2 KB | 186.3 ms | 20.2 ms |
+| 7 | compact | 233.3 KB | 96.8 ms | 96.7 ms |
+| 12 | append | 505.8 KB | 208.2 ms | 20.0 ms |
+
+**plain 的上传耗时随上下文线性增长，tail 的基本是一条水平线**——因为它每轮只上行
+「新增的那一轮」（约 55 KB），与上下文多长无关。这就是「一次 turn 跑半天」的 agent
+为什么受益最大：上下文越长，每轮重传的浪费越多。
+
+### 用真实 agent SDK 接入
+
+上表是裸 HTTP 发的。换成 agent 实际用的官方 `openai` SDK，客户端代码**一字不差**，
+只有 `model=` 里的 provider 名不同：
+
+```python
+client = OpenAI(base_url="http://127.0.0.1:3425/v1", api_key="magpie")
+stream = client.chat.completions.create(model="plain/<upstream>", messages=…, stream=True)
+stream = client.chat.completions.create(model="tail/<upstream>",  messages=…, stream=True)
+```
+
+8 轮、82 KB → 219 KB、25 Mbps 实测：plain 1.18 MB / 0.49 s，tail 0.22 MB / 0.08 s
+（5.4x，省 0.41 s），第 2 轮起 tail 每轮固定 20.2 KB / 6.7 ms。
+
+复跑：
 
 ```bash
 # magpie 侧：go build -tags nogui -o /tmp/magpie-tail .
-python -m tools.magpie_native --magpie /tmp/magpie-tail --rounds 10
+python -m tools.magpie_native --magpie /tmp/magpie-tail --rounds 10      # 纯追加,只测字节
+python -m tools.realworld --magpie /tmp/magpie-tail --rounds 20 --mbps 25 \
+    --compact-every 10 --branch-every 7 --sessions 2 --turn-kb 24 --system-kb 40
+python -m tools.agent_sdk  --magpie /tmp/magpie-tail --rounds 8 --mbps 25  # 真实 openai SDK
 ```
 
 ### 不改 magpie 的部署方式（旁路代理）
@@ -398,8 +456,19 @@ python -m tail.proxy --upstream http://10.0.0.5:8765 --port 8766
 ```
 
 `tail/proxy.py` 就是同协议的客户端侧参考实现（`--native` 可切换成纯转发做基线）。
-对着两个真实 magpie 跑这套旁路：`python -m tools.magpie_live --magpie <二进制>`；
-只跑协议本身（不用 magpie）：`python -m tools.magpie_pair`。
+
+### 取数工具一览
+
+| 工具 | 跑的是什么 | 用来回答 |
+| --- | --- | --- |
+| `tools/magpie_pair.py` | 两个角色都是 Python 实现，进程内 | 协议本身对不对、字节省多少 |
+| `tools/magpie_live.py` | 旁路代理 + 两个**真实 magpie** | 不改 magpie 时的字节对比 |
+| `tools/magpie_native.py` | 两个**真实 magpie**，magpie 源码自带 tail | magpie 原生实现省多少字节 |
+| `tools/realworld.py` | 同上，但轨迹含 compact/分支/多会话，**链路按带宽限速** | 真实场景下省多少**时间** |
+| `tools/agent_sdk.py` | 同上，客户端换成官方 `openai` SDK | 接到 agent 上有没有区别 |
+
+后三个共用 `tools/traffic.py`（生成带事件的真实轨迹）与 `tools/link.py`
+（限速链路 + 按请求切上传窗口）。
 
 ## 线上格式
 
@@ -533,7 +602,16 @@ H → block[1773] → parent → block[1772] → ... → block[0] → 链根
 python -m pytest tests/ -v
 ```
 
-90 个测试（含 11 个 Redis 真机用例，连不上 Redis 时自动 skip），覆盖分块与前缀复用、
+102 个测试（含 11 个 Redis 真机用例，连不上 Redis 时自动 skip），覆盖分块与前缀复用、
 渲染确定性、前缀自检、链式存储、Lua 写链/走链/续期、客户端 → ASGI 网关 → mock 上游
 的端到端链路（含 409 降级与恢复），以及用真实 `openai` SDK 经 `TailTransport`
 接入的回归测试。
+
+另有一组**取数工具**自己的测试（`tests/test_traffic_link.py`），钉住两件会被悄悄
+弄坏的事：
+
+- 轨迹生成器真的会产生 compact / branch / new_tools / 并行会话，而不是永远只产生
+  append——否则「真实场景」的数据其实是理想情况；
+- **限速链路真的按带宽计时**。这一条格外重要：第一版实现里中继不限速、窗口按连接
+  算，量出来全是 0 ms，数字看着正常但什么都没测。测试要求实测耗时落在
+  「字节 / 带宽」的同一量级内，并要求串行的两次上传切成两个窗口。
