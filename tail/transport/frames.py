@@ -56,7 +56,20 @@ def encode_ref(block_hash: bytes) -> bytes:
 
 
 def encode_new(block_hash: bytes, content: bytes) -> bytes:
-    """新块帧:头部 + 内容。"""
+    """新块帧:头部 + 内容。
+
+    **为什么每块要多花 16 字节带上 ``block_hash``,而不让解码端自己算?**
+
+    因为解码端算不出来。哈希链是 ``hash(父哈希 + 本块)``,而解码端看到的是
+    **帧序列**:其中的引用帧不带内容、只带哈希。要独立重算某个新块的哈希,
+    就必须知道它前一块的真实哈希——那个块可能正是被跳过(引用)的。
+
+    唯一的替代是让引用帧也带父哈希,那引用帧会从 17 B 涨到 33 B,比新块帧
+    多带的 16 B 更亏(稳态下引用帧远多于新块帧)。
+
+    所以:发送方算哈希并随帧传来,是这块唯一划算的方案。
+    详见 docs/TRANSPORT-PIPELINE.md §5.2。
+    """
     if len(block_hash) != BLOCK_ID_SIZE:
         raise ValueError(
             f"block_hash 必须是 {BLOCK_ID_SIZE} 字节,得到 {len(block_hash)}")
