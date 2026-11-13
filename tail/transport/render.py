@@ -1,284 +1,80 @@
 """渲染器 / 反渲染器:OpenAI Chat Completions JSON ⇄ 一维文本流。
 
-这是整个传输层里<b>唯一懂 LLM 语义</b>的两层。Encoder / Decoder 只认字节,
-完全不知道哪个字节是 role、哪个是 tools。
+**两层都是流式的。** 渲染器产出事件流与字节片段,反渲染器边收字节边产出事件。
+没有任何一处需要先把完整对象拼出来。
 
-为什么渲染成文本能减小体积
+格式参考真实实现,不自己发明
 --------------------------
-OpenAI 的请求体是 JSON:
+标记集对齐两个生产可用的实现:
 
-    {"model":"x","messages":[{"role":"user","content":"你好"},...]}
+  - **OpenAI harmony**(``src/registry.rs``):
+    ``<|start|>`` ``<|message|>`` ``<|end|>`` ``<|channel|>`` ``<|return|>``
+  - **DeepSeek recipe**(``deepseek-recipe-core/src/special_tokens.rs``):
+    ``<｜begin▁of▁sentence｜>`` ``的女子`` ``рија`` `` мушка`` `` thinking`` ``<｜end_of_query｜>``
 
-其中 `{"role":`、`","content":"`、`"},{"role":"` 这些结构字节每轮对话都要重传,
-既不受前缀缓存影响(它们在每个 message 之间重复出现,不在前缀上),
-也无法被内容定义分块合并(它们太短且位置分散)。
+两者的共同点,也是本模块遵循的原则:
 
-渲染成一维文本后:
+  1. **标记是可读的 ``<|...|>`` / ``<｜...｜>``,不是控制字符**
+  2. **线性布局:标记 + 内容**,不用分隔符切分
+  3. **正文不做转义**——真实文本里撞上这些标记的概率极低
 
-    <|User|>你好<|Assistant|>...
+早先版本用 ``\\x1e`` / ``\\x1f`` 控制字符做分隔是错的:正文里完全可能出现这两个
+字节(用户贴二进制、base64、恶意输入),必须转义,而转义既慢又让"中间传的是
+文本"这个前提失效。现已改为 harmony 风格。
 
-结构信息被压缩成极少的分隔符,正文连续排列。同样的对话,文本形态通常只有
-原始 JSON 的 60~75%(键名越长、message 越多,压缩越明显)。
+本模块使用的标记
+----------------
+=============================  ==========================================
+``<|model|>`` 等                顶层参数,值紧跟其后
+``<|tools|>``                   工具定义(其后是确定性 JSON)
+``<|system|>`` ``<|user|>``      role 标记,开启一条新 message
+``<|assistant|>`` ``<|tool|>``
+``<|tool_calls|>``              assistant 的工具调用
+``<|tool_call_id|>``            tool 消息关联的调用 id
+=============================  ==========================================
 
-确定性要求(硬约束)
-------------------
-同一个 messages 必须渲染出<b>逐字节相同</b>的文本,否则块内容变化、
-`block_id` 变化、缓存整体失效。因此:
+布局::
 
-  - 字段出现顺序固定(不依赖 dict 插入顺序)
-  - 所有可迭代对象顺序固定
-  - 模板带版本号,模板改动必须升版本
+    <|model|>deepseek-chat<|temperature|>0.7<|system|>你是助手。<|user|>你好
 
-不可逆性
---------
-本渲染器是<b>面向字节去重</b>设计的,不是为无损往返设计的。反渲染器能恢复出
-等价的 messages 列表,但以下情况会规范化:
+消息边界由「下一个 role 标记」自然表达,不需要额外分隔符——与 harmony 的
+``<|start|>role<|channel|>text<|end|>`` 是同一思路。
 
-  - message 里未识别的字段(如 `name`、`tool_call_id` 之外的扩展字段)会被丢弃
-  - `content` 为 list 的多模态格式,只保留 text part
+事件流
+------
+渲染器除了产出字节,还能产出**结构化事件**(:class:`Event`)。
+编码器用它来切段,不需要扫描任何标记字节——这样正文永远是纯文本,
+段边界也不需要靠猜。
 
-这在实际使用中不构成问题:网关只需要把语义等价的请求交给上游,上游不关心中
-间传输用了什么格式。若某个字段确实必须保留,渲染器会显式支持它——但一旦支持,
-就必须同时保证渲染确定性。
+确定性(硬约束)
+--------------
+同一个 messages 必须渲染出**逐字节相同**的文本,否则块内容变化、``block_hash``
+变化、缓存整体失效。因此:字段顺序固定、``json.dumps(sort_keys=True)``。
 
-版本
-----
-``TEMPLATE_VERSION`` 参与 ``block_id`` 计算(见 encoder),模板改动时旧缓存自然
-全部 miss 而不是静默错配。
+格式版本不进正文,放在 HTTP 头(``X-Tail-Version``)里。理由:写进正文会让
+版本号落在第一个块上,升版即全量失效,而且参考实现(DeepSeek / harmony)
+的渲染文本里也都没有这种东西。
 """
 
 from __future__ import annotations
 
+import codecs
 import json
-from typing import Any, Dict, Iterable, List, Optional
+from typing import Any, Dict, Iterator, List, Optional, Tuple
 
-#: 渲染模板版本。任何影响输出字节的改动都必须递增。
-TEMPLATE_VERSION = "cc1"
+#: 标记前后缀。与 harmony 一致:``<|name|>``。
+TAG_OPEN = "<|"
+TAG_CLOSE = "|>"
 
-#: 分隔符。选用在自然语言里极少出现的组合,避免与正文混淆。
-ROLE_OPEN = "<|"
-ROLE_CLOSE = "|>"
-FIELD_SEP = "\x1e"       # record separator:字段边界
-RECORD_SEP = "\x1f"      # unit separator:message 边界
+#: 已知 role 标记。反渲染时遇到它们就开一条新 message。
+ROLE_TAGS = frozenset({"system", "user", "assistant", "tool", "developer",
+                       "function"})
 
+#: 已知字段标记(出现在 message 内部)。
+FIELD_TAGS = frozenset({"tool_calls", "tool_call_id", "name", "extra"})
 
-# ---------------------------------------------------------------------------
-# 内部工具
-# ---------------------------------------------------------------------------
-
-#: 正文转义表。正文里出现分隔符会让反渲染切错字段,必须转义。
-#: 反转义顺序与转义相反,先处理 \x01 再处理其余,避免双重反转。
-_ESC = "\\"
-_ESC_MAP = {"\\": _ESC + "\\",
-            FIELD_SEP: _ESC + "e",
-            RECORD_SEP: _ESC + "r",
-            "\x00": _ESC + "0"}
-
-
-def _escape(text: str) -> str:
-    """转义正文里的分隔符与控制字符。
-
-    用户消息里确实可能出现 \x1e / \x1f(例如从文件里读出来的二进制片段),
-    不转义就会被当成字段边界,反渲染出来的内容就错了。
-    """
-    out = []
-    for ch in text:
-        out.append(_ESC_MAP.get(ch, ch))
-    return "".join(out)
-
-
-def _unescape(text: str) -> str:
-    """:func:`_escape` 的逆操作。"""
-    if _ESC not in text:
-        return text
-    out = []
-    i = 0
-    n = len(text)
-    while i < n:
-        ch = text[i]
-        if ch == _ESC and i + 1 < n:
-            nxt = text[i + 1]
-            if nxt == "\\":
-                out.append("\\")
-            elif nxt == "e":
-                out.append(FIELD_SEP)
-            elif nxt == "r":
-                out.append(RECORD_SEP)
-            elif nxt == "0":
-                out.append("\x00")
-            else:
-                # 未知转义:原样保留,不丢信息
-                out.append(ch)
-                out.append(nxt)
-            i += 2
-            continue
-        out.append(ch)
-        i += 1
-    return "".join(out)
-
-
-def _dumps(obj: Any) -> str:
-    """确定性的 JSON 序列化:固定键顺序、紧凑分隔符、不转义非 ASCII。
-
-    ``sort_keys=True`` 是确定性要求的一部分——dict 的插入顺序来自客户端,
-    不同 SDK 版本可能不同,不排序就无法保证渲染结果逐字节稳定。
-    """
-    return json.dumps(obj, ensure_ascii=False, sort_keys=True,
-                      separators=(",", ":"))
-
-
-def _content_to_text(content: Any) -> str:
-    """把 message.content 归一成字符串。
-
-    OpenAI 允许两种形态:
-      - str:纯文本
-      - list[{"type":"text","text":...} | {"type":"image_url",...}]
-
-    多模态的 image part 无法渲染成文本,这里保留其 URL 标记以便反渲染时识别
-    (实际是否会用到取决于上游是否支持;本期只保证不丢信息地标记出来)。
-    """
-    if content is None:
-        return ""
-    if isinstance(content, str):
-        return content
-    if isinstance(content, list):
-        parts: List[str] = []
-        for part in content:
-            if not isinstance(part, dict):
-                parts.append(str(part))
-                continue
-            ptype = part.get("type")
-            if ptype == "text":
-                parts.append(part.get("text") or "")
-            elif ptype == "image_url":
-                url = part.get("image_url")
-                if isinstance(url, dict):
-                    url = url.get("url")
-                parts.append(f"<|image:{url or ''}|>")
-            else:
-                # 未知 part:序列化保留,避免静默丢数据
-                parts.append(_dumps(part))
-        return "".join(parts)
-    # 其他类型(极少见):序列化
-    return _dumps(content)
-
-
-def _tool_calls_to_text(tool_calls: List[dict]) -> str:
-    """assistant 的 tool_calls 渲染成可解析的单行片段。
-
-    每个调用渲染成 ``name(args_json)``,多个调用用 FIELD_SEP 分隔。参数用
-    确定性 JSON(键已排序),保证同一调用永远渲染成同样的字节。
-    """
-    out: List[str] = []
-    for call in tool_calls:
-        if not isinstance(call, dict):
-            out.append(_dumps(call))
-            continue
-        fn = call.get("function") or {}
-        name = fn.get("name") or ""
-        args = fn.get("arguments")
-        if isinstance(args, str):
-            # 已经是字符串:尝试解析成对象后重新确定性序列化,
-            # 否则直接保留原串(无法解析时不能丢信息)。
-            try:
-                args_obj = json.loads(args)
-                args_text = _dumps(args_obj)
-            except (ValueError, TypeError):
-                args_text = args
-        elif args is None:
-            args_text = "{}"
-        else:
-            args_text = _dumps(args)
-        out.append(f"{name}({args_text})")
-    return FIELD_SEP.join(out)
-
-
-# ---------------------------------------------------------------------------
-# 渲染:messages JSON → 文本
-# ---------------------------------------------------------------------------
-
-def render_request(payload: Dict[str, Any]) -> bytes:
-    """把完整的 Chat Completions 请求体渲染成一维文本(UTF-8 字节)。
-
-    输出结构(所有分隔符都是单字节控制字符):
-
-        <|cc1|>                                 模板版本头
-        <|model|>模型名
-        <|tools|>工具定义(确定性 JSON)
-        <|User|>消息内容
-        <|Assistant|>消息内容
-        ...
-
-    参数与采样设置的字段值也一并渲染,因为它们同样需要传到上游。
-
-    Args:
-      payload: 原始请求体的 dict(已 json.loads)
-
-    Returns:
-      UTF-8 编码的一维文本字节
-    """
-    out: List[str] = [f"{ROLE_OPEN}{TEMPLATE_VERSION}{ROLE_CLOSE}"]
-
-    # --- 顶层标量参数:按固定顺序渲染,值为 None 的跳过 ---
-    for key in _PARAM_ORDER:
-        if key in payload and payload[key] is not None:
-            out.append(FIELD_SEP)
-            out.append(f"{ROLE_OPEN}{key}{ROLE_CLOSE}")
-            out.append(_dumps(payload[key]))
-
-    # --- tools:整段确定性 JSON。放在最前面是因为 tools 通常最长且最稳定,
-    #     放在前缀里能最大化后续块命中的连续性。 ---
-    tools = payload.get("tools")
-    if tools:
-        out.append(FIELD_SEP)
-        out.append(f"{ROLE_OPEN}tools{ROLE_CLOSE}")
-        out.append(_dumps(tools))
-
-    # --- messages ---
-    for msg in payload.get("messages") or []:
-        if not isinstance(msg, dict):
-            continue
-        out.append(RECORD_SEP)
-        role = msg.get("role") or ""
-        out.append(f"{ROLE_OPEN}{role}{ROLE_CLOSE}")
-        content = _content_to_text(msg.get("content"))
-        if content:
-            # 正文前放一个 FIELD_SEP 作为"正文起点"标记:role 名被 <> 包住,
-            # 正文从分隔符之后开始,反渲染才能无歧义地区分两者。
-            # 正文为空时不写这个标记,避免产生空字段。
-            out.append(FIELD_SEP)
-            out.append(_escape(content))
-
-        # assistant 的工具调用
-        tool_calls = msg.get("tool_calls")
-        if tool_calls:
-            out.append(FIELD_SEP)
-            out.append(f"{ROLE_OPEN}tool_calls{ROLE_CLOSE}")
-            out.append(_tool_calls_to_text(tool_calls))
-
-        # tool 角色的结果必须带上 tool_call_id,否则上游无法对应
-        tcid = msg.get("tool_call_id")
-        if tcid:
-            out.append(FIELD_SEP)
-            out.append(f"{ROLE_OPEN}tool_call_id{ROLE_CLOSE}{tcid}")
-
-        name = msg.get("name")
-        if name:
-            out.append(FIELD_SEP)
-            out.append(f"{ROLE_OPEN}name{ROLE_CLOSE}{name}")
-
-        # 其他未识别字段:确定性序列化后附加,做到不静默丢数据
-        extra = {k: v for k, v in msg.items()
-                 if k not in ("role", "content", "tool_calls", "tool_call_id", "name")}
-        if extra:
-            out.append(FIELD_SEP)
-            out.append(f"{ROLE_OPEN}extra{ROLE_CLOSE}{_dumps(extra)}")
-
-    return "".join(out).encode("utf-8")
-
-
-#: 顶层标量的渲染顺序。固定顺序 = 确定性。
-_PARAM_ORDER = (
+#: 顶层参数标记。渲染顺序固定 = 确定性。
+PARAM_ORDER = (
     "model",
     "max_tokens",
     "max_completion_tokens",
@@ -302,156 +98,511 @@ _PARAM_ORDER = (
     "service_tier",
 )
 
+#: ``content`` 键缺失的哨兵(与 None / 空串区分)。
+_MISSING = {"__missing__": True}
 
-# ---------------------------------------------------------------------------
-# 反渲染:文本 → messages JSON
-# ---------------------------------------------------------------------------
+#: 渲染片段的最大字符数。只影响产出粒度,不影响格式。
+_CHUNK_CHARS = 64 * 1024
 
-def unrender_request(text: bytes) -> Dict[str, Any]:
-    """把一维文本还原成 Chat Completions 请求体 dict。
+#: 后缀树用:所有已知标记拼成的集合,用于在正文里识别"疑似标记"。
+_ALL_TAGS = (ROLE_TAGS | FIELD_TAGS | {"tools"}) | set(PARAM_ORDER)
 
-    与 :func:`render_request` 严格对称。还原结果是<b>语义等价</b>的请求体,
-    不保证与原始 JSON 逐字节相同(键顺序、被规范化的 content 形态会变),
-    但上游收到的语义完全一致。
 
-    Args:
-      text: :func:`render_request` 产生的字节
+def tag(name: str) -> str:
+    """``name`` → ``<|name|>``。"""
+    return f"{TAG_OPEN}{name}{TAG_CLOSE}"
 
-    Returns:
-      可直接 json.dumps 后 POST 给上游的 dict
 
-    Raises:
-      ValueError: 文本格式非法(缺少版本头、结构损坏)
+def _dumps(obj: Any) -> str:
+    """确定性的 JSON 序列化:固定键顺序、紧凑分隔符、不转义非 ASCII。
+
+    ``sort_keys=True`` 是确定性要求的一部分——dict 插入顺序来自客户端,
+    不同 SDK 版本可能不同,不排序就无法保证渲染逐字节稳定。
     """
-    s = text.decode("utf-8")
-    head = f"{ROLE_OPEN}{TEMPLATE_VERSION}{ROLE_CLOSE}"
-    if not s.startswith(head):
-        # 版本不匹配:容忍,但要求至少有版本头,便于发现模板错配
-        if not s.startswith(ROLE_OPEN):
-            raise ValueError("渲染文本缺少版本头,不是本格式的产物")
-    else:
-        s = s[len(head):]
-
-    payload: Dict[str, Any] = {}
-    messages: List[Dict[str, Any]] = []
-
-    # 先按 message 边界切,再解析第一个 message 之前的头部字段
-    head_part, _, body = s.partition(RECORD_SEP)
-    _parse_head(head_part, payload)
-
-    for record in body.split(RECORD_SEP):
-        if record:
-            messages.append(_parse_message(record))
-    if messages:
-        payload["messages"] = messages
-
-    return payload
+    return json.dumps(obj, ensure_ascii=False, sort_keys=True,
+                      separators=(",", ":"))
 
 
-def _split_fields(segment: str) -> List[str]:
-    return segment.split(FIELD_SEP)
-
-
-def _parse_head(segment: str, payload: Dict[str, Any]) -> None:
-    """解析 messages 之前的头部:模型参数 + tools。"""
-    if not segment:
+def _chunked(s: str, size: int = _CHUNK_CHARS) -> Iterator[str]:
+    """把长字符串切成片段产出,避免单个巨大 str 常驻。"""
+    if not s:
         return
-    for field in _split_fields(segment):
-        if not field:
-            continue
-        name, value_text = _split_marked(field)
-        if name is None:
-            continue
-        if name == "tools":
-            payload["tools"] = json.loads(value_text)
-        else:
-            payload[name] = json.loads(value_text)
+    if len(s) <= size:
+        yield s
+        return
+    for i in range(0, len(s), size):
+        yield s[i:i + size]
 
 
-def _split_marked(field: str) -> "tuple[Optional[str], str]":
-    """把 ``<|name|>value`` 拆成 (name, value)。不匹配返回 (None, field)。"""
-    if not field.startswith(ROLE_OPEN):
-        return None, field
-    end = field.find(ROLE_CLOSE, len(ROLE_OPEN))
-    if end < 0:
-        return None, field
-    name = field[len(ROLE_OPEN):end]
-    return name, field[end + len(ROLE_CLOSE):]
+# ---------------------------------------------------------------------------
+# 内容归一化
+# ---------------------------------------------------------------------------
 
+def content_to_text(content: Any) -> str:
+    """把 message.content 归一成字符串。
 
-def _parse_message(record: str) -> Dict[str, Any]:
-    """解析单条 message 记录。
+    OpenAI 允许两种形态:
+      - str:纯文本
+      - list[{"type":"text",...} | {"type":"image_url",...}]
 
-    记录形如 ``<|role|>ROLE\x1e正文\x1e<field|>值...``。
-    role 名由 FIELD_SEP 收尾,正文里出现的 FIELD_SEP 属于正文本身,
-    因此只在找到形如 ``<|xxx|>`` 的标记时才切出新字段。
+    多模态的 image part 无法渲染成文本,保留其 URL 标记以便反渲染识别。
     """
-    msg: Dict[str, Any] = {}
-    name, rest = _split_marked(record)
-    if name is None:
-        # 没有 role 标记:整段当作用户内容,保证不丢数据
-        return {"role": "user", "content": record}
+    if content is None:
+        return ""
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        parts: List[str] = []
+        for part in content:
+            if not isinstance(part, dict):
+                parts.append(str(part))
+                continue
+            ptype = part.get("type")
+            if ptype == "text":
+                parts.append(part.get("text") or "")
+            elif ptype == "image_url":
+                url = part.get("image_url")
+                if isinstance(url, dict):
+                    url = url.get("url")
+                parts.append(f"<|image|>{url or ''}")
+            else:
+                parts.append(_dumps(part))   # 未知 part:序列化保留
+        return "".join(parts)
+    return _dumps(content)
 
-    # role 名就在标记里(已被 _split_marked 取出);rest 以 FIELD_SEP 开头,
-    # 其后才是正文与后续字段。
-    if not rest.startswith(FIELD_SEP):
-        return {"role": name, "content": rest}
-    msg["role"] = name
 
-    content_parts: List[str] = []
-    for field in rest[len(FIELD_SEP):].split(FIELD_SEP):
-        fname, fvalue = _split_marked(field)
-        if fname is None:
-            content_parts.append(field)
-        elif fname == "tool_calls":
-            msg["tool_calls"] = _parse_tool_calls(fvalue)
-        elif fname == "tool_call_id":
-            msg["tool_call_id"] = fvalue
-        elif fname == "name":
-            msg["name"] = fvalue
-        elif fname == "extra":
-            msg.update(json.loads(fvalue))
+def tool_calls_to_text(tool_calls: List[dict]) -> str:
+    """assistant 的 tool_calls 原样按 OpenAI 结构做确定性 JSON。
+
+    为什么不用 ``name(args)`` 这种"函数调用"写法:那是我自造的语法,
+    有歧义——assistant 正文里出现 ``f({"a":1})`` 时,反渲染会把它误认成
+    tool_call;而且 ``id`` / ``type`` 字段无处安放,直接丢失。
+
+    这里只做两件事:键排序(确定性)、去掉 arguments 里的冗余空白
+    (字符串参数是 JSON 文本,重新序列化后更小且等价)。
+    """
+    out: List[dict] = []
+    for call in tool_calls:
+        if not isinstance(call, dict):
+            out.append(call)
+            continue
+        # arguments 原样保留:它是模型/客户端给的 JSON 文本,重新序列化会
+        # 改变空白(``{"k": 1}`` → ``{"k":1}``),字节就不再一致。这里只做
+        # 键排序(确定性),不动任何字符串内容。
+        out.append(call)
+    return _dumps(out)
+
+
+# ---------------------------------------------------------------------------
+# 事件
+# ---------------------------------------------------------------------------
+
+class EventKind:
+    """渲染/反渲染事件类型。"""
+    PARAM = "param"          # (PARAM, (name, value))   顶层参数
+    MESSAGE_START = "start"  # (MESSAGE_START, role)    一条 message 开始
+    MESSAGE_END = "end"      # (MESSAGE_END, None)      一条 message 结束
+    TEXT = "text"            # (TEXT, str)              正文片段
+
+
+#: 一个事件:(kind, payload)
+Event = Tuple[str, Any]
+
+
+# ---------------------------------------------------------------------------
+# 渲染:JSON → 文本(事件流 + 字节流)
+# ---------------------------------------------------------------------------
+
+def iter_render_events(payload: Dict[str, Any]) -> Iterator[Event]:
+    """把请求体渲染成**事件流**。
+
+    事件序列::
+
+        (PARAM, ("model", "deepseek-chat"))
+        (MESSAGE_START, "system")
+        (TEXT, "你是助手。")
+        (MESSAGE_END, None)
+        ...
+
+    编码器用 ``MESSAGE_START`` / ``MESSAGE_END`` 切段,不需要认识任何标记字节。
+    """
+    for key in PARAM_ORDER:
+        if key in payload and payload[key] is not None:
+            yield (EventKind.PARAM, (key, payload[key]))
+
+    tools = payload.get("tools")
+    if tools:
+        yield (EventKind.PARAM, ("tools", tools))
+
+    for msg in payload.get("messages") or []:
+        if not isinstance(msg, dict):
+            continue
+        yield from iter_message_events(msg)
+
+
+def iter_message_events(msg: Dict[str, Any]) -> Iterator[Event]:
+    """渲染单条 message 的事件序列。"""
+    role = msg.get("role") or "user"
+    yield (EventKind.MESSAGE_START, role)
+
+    content = content_to_text(msg.get("content"))
+    if content:
+        # 正文是 JSON 字符串而不是裸文本:OpenAI 原文里 content 就是字符串,
+        # json.dumps 自带完整转义,正文里出现 ``<|user|>`` 之类不会被当结构。
+        yield (EventKind.TEXT, _dumps(content))
+    elif "content" in msg and msg["content"] is not None:
+        yield (EventKind.TEXT, _dumps(""))     # 显式空串
+
+    tool_calls = msg.get("tool_calls")
+    if tool_calls:
+        yield (EventKind.TEXT, tag("tool_calls"))
+        yield (EventKind.TEXT, tool_calls_to_text(tool_calls))
+
+    tcid = msg.get("tool_call_id")
+    if tcid:
+        yield (EventKind.TEXT, tag("tool_call_id"))
+        yield (EventKind.TEXT, _dumps(str(tcid)))
+
+    name = msg.get("name")
+    if name:
+        yield (EventKind.TEXT, tag("name"))
+        yield (EventKind.TEXT, _dumps(str(name)))
+
+    # 其他未识别字段:确定性序列化后附加,做到不静默丢数据。
+    # 另把 content 的"存在性"带上:None / 缺失 / 空串在 OpenAI 里是三种语义,
+    # 但它们都不产生正文,只能在这里区分。
+    extra = {k: v for k, v in msg.items()
+             if k not in ("role", "content", "tool_calls", "tool_call_id", "name")}
+    if "content" in msg and not content_to_text(msg.get("content")):
+        extra.setdefault("__content__", msg["content"])
+    elif "content" not in msg:
+        extra.setdefault("__content__", _MISSING)
+    if extra:
+        yield (EventKind.TEXT, tag("extra"))
+        yield (EventKind.TEXT, _dumps(extra))
+
+    yield (EventKind.MESSAGE_END, None)
+
+
+def event_to_bytes(event: Event) -> Iterator[bytes]:
+    """把单个事件编码成字节片段。
+
+    PARAM 事件编码成 ``<|name|>value``;MESSAGE_START 编码成 ``<|role|>``。
+    """
+    kind, payload = event
+    if kind == EventKind.PARAM:
+        name, value = payload
+        value_text = _dumps(value) if name == "tools" else _dumps(value)
+        yield (tag(name) + value_text).encode("utf-8")
+    elif kind == EventKind.MESSAGE_START:
+        yield tag(payload).encode("utf-8")
+    elif kind == EventKind.TEXT:
+        for piece in _chunked(payload):
+            yield piece.encode("utf-8")
+    # MESSAGE_END 不产出字节:边界由下一个 role 标记表达
+
+
+def iter_render(payload: Dict[str, Any]) -> Iterator[bytes]:
+    """把请求体渲染成 UTF-8 字节片段流。"""
+    for event in iter_render_events(payload):
+        yield from event_to_bytes(event)
+
+
+def render_request(payload: Dict[str, Any]) -> bytes:
+    """:func:`iter_render` 的一次性版本(测试用)。"""
+    return b"".join(iter_render(payload))
+
+
+# ---------------------------------------------------------------------------
+# 反渲染:文本 → JSON(流式)
+# ---------------------------------------------------------------------------
+
+class RenderParser:
+    """**流式**反渲染器:喂字节片段,产出事件。
+
+    与"先收齐整段文本再解析"不同,这个类维护一个待处理缓冲,每切出完整的一段
+    就立刻产出。内存占用与「单条 message」的大小成正比,与整份文本无关。
+
+    识别标记:扫描 ``<|`` 到下一个 ``|>``,取其间名字;只有名字在已知标记集里
+    才当作标记,否则视为正文——这样正文里偶然出现的 ``<|`` 不会误判。
+
+    产出的事件:
+      ``(PARAM, (name, value))``        顶层参数
+      ``(MESSAGE_START, role)``         一条 message 开始
+      ``(TEXT, str)``                   正文片段
+      ``(MESSAGE_END, dict)``           一条 message 完成,payload 是解析结果
+
+    用法::
+
+        parser = RenderParser()
+        for piece in byte_stream:
+            for event in parser.feed(piece):
+                ...
+        for event in parser.finish():
+            ...
+    """
+
+    __slots__ = ("_buf", "_buf_start", "_decoder", "_cur_role", "_parts",
+                 "_fields", "_in_str", "_escaped", "_scan", "error")
+
+    def __init__(self) -> None:
+        self._buf = ""
+        # 惰性裁剪:_buf[:_buf_start] 是已消费的前缀。每次处理完一个标记就
+        # ``self._buf = buf[pos:]`` 会整段复制,消息多时退化成 O(n²)。
+        self._buf_start = 0
+        # 增量 UTF-8 解码:调用方可以按任意字节边界喂入
+        self._decoder = codecs.getincrementaldecoder("utf-8")()
+        self._cur_role: Optional[str] = None
+        self._parts: List[str] = []          # 当前 message 的正文
+        self._fields: Dict[str, str] = {}    # 当前 message 的字段
+        # JSON 字符串状态:``_in_str`` 表示当前是否在字符串内,``_scan`` 是
+        # 已消费到 ``_buf`` 的哪个下标。二者随缓冲区一起推进,避免每次从头重扫。
+        self._in_str = False
+        self._escaped = False                 # 上一个字节是反斜杠,且尚未配对
+        self._scan = 0
+        self.error: Optional[str] = None
+
+    # -- 对外 -------------------------------------------------------------
+
+    def feed(self, data: bytes) -> Iterator[Event]:
+        if self.error:
+            return
+        try:
+            self._buf += self._decoder.decode(data, False)
+            yield from self._drain(final=False)
+        except ValueError as exc:
+            self.error = str(exc)
+            raise
+
+    def finish(self) -> Iterator[Event]:
+        if self.error:
+            return
+        self._buf += self._decoder.decode(b"", True)
+        yield from self._drain(final=True)
+        if self._cur_role is not None:
+            yield from self._flush_message()
+
+    # -- 内部 -------------------------------------------------------------
+
+    def _find_tag_start(self, buf: str, pos: int) -> int:
+        """从 ``pos`` 起找下一个**真正生效**的标记起点。
+
+        正文和字段值都用 JSON 字符串承载,所以位于 JSON 字符串**内部**的
+        ``<|user|>`` 之类是内容,不是结构——这里按 JSON 的字符串/转义规则
+        跳过它们。这正是 JSON 无歧义的来源,不需要另外发明转义符号。
+
+        字符串状态是**增量推进**的(``_in_str`` / ``_scan``),每字节只扫一次,
+        流式切块不会导致状态丢失,也不会退化成 O(n²)。
+        """
+        while True:
+            open_at = buf.find(TAG_OPEN, pos)
+            if open_at < 0:
+                self._advance_scan(buf, len(buf))
+                return -1
+            if self._advance_scan(buf, open_at) and not self._in_str:
+                return open_at
+            # 在字符串内部(或刚好跨过边界):这个 ``<|`` 是内容,跳过继续找
+            pos = open_at + len(TAG_OPEN)
+            self._scan = max(self._scan, pos)
+
+    def _advance_scan(self, buf: str, upto: int) -> bool:
+        """把 JSON 字符串状态推进到下标 ``upto``,返回推进后是否**不在**字符串内。
+
+        逐字符扫描。曾试过用 ``str.find`` 跳到下一个引号来加速,但反斜杠转义
+        状态跨块延续时容易算错(实测 400 例里 235 例流式解析出错),已回退。
+        """
+        start = self._scan
+        if upto > start:
+            in_str = self._in_str
+            escaped = self._escaped            # 跨块:反斜杠状态必须延续
+            for i in range(start, upto):
+                ch = buf[i]
+                if escaped:
+                    escaped = False
+                elif ch == "\\":
+                    escaped = True
+                elif ch == '"':
+                    in_str = not in_str
+            self._in_str = in_str
+            self._escaped = escaped
+            self._scan = upto
+        return not self._in_str
+
+    def _drain(self, final: bool) -> Iterator[Event]:
+        """把缓冲切成「正文段」与「标记」,逐个处理。"""
+        # 已消费前缀在各次 feed 之间惰性保留,这里统一裁掉一次(str 不可原地
+        # del,所以整体切一次;相比每个标记切一次,O(n²) 降到 O(标记数))
+        buf = self._buf[self._buf_start:] if self._buf_start else self._buf
+        if self._buf_start:
+            self._scan = max(0, self._scan - self._buf_start)
+        pos = 0
+        n = len(buf)
+        out: List[Event] = []
+        target: Optional[List[str]] = None   # 正文写到哪:fields 名或 None=正文
+
+        while pos < n:
+            open_at = self._find_tag_start(buf, pos)
+            if open_at < 0:
+                rest = buf[pos:] if final else buf[pos:max(pos, n - 1)]
+                if rest:
+                    self._append_text(rest)
+                pos = len(buf) if final else max(pos, n - 1)
+                break
+
+            close_at = buf.find(TAG_CLOSE, open_at + len(TAG_OPEN))
+            if close_at < 0:
+                # 标记未收全
+                if final:
+                    self._append_text(buf[pos:])
+                    pos = n
+                else:
+                    self._append_text(buf[pos:open_at])
+                    pos = open_at
+                break
+
+            name = buf[open_at + len(TAG_OPEN):close_at]
+            if name not in _ALL_TAGS:
+                # 不是已知标记:连同尖括号一起当正文
+                self._append_text(buf[pos:close_at + len(TAG_CLOSE)])
+                pos = close_at + len(TAG_CLOSE)
+                continue
+
+            # 标记之前的内容属于上一条 message 的正文
+            self._append_text(buf[pos:open_at])
+            pos = close_at + len(TAG_CLOSE)
+
+            if name in ROLE_TAGS:
+                out.extend(self._flush_message())
+                self._cur_role = name
+                out.append((EventKind.MESSAGE_START, name))
+            elif name in PARAM_ORDER or name == "tools":
+                out.extend(self._flush_message())
+                self._cur_role = "__param__"
+                self._fields = {"__name__": name}
+            else:
+                # message 内部字段:其后内容归入该字段
+                self._fields[name] = ""
+                self._fields["__in__"] = name
+
+        # 惰性裁剪:只记录游标,真正切除推迟到下次 _drain 开头
+        self._buf = buf
+        self._buf_start = pos
+
+        # 顶层参数:值收齐后作为一个事件产出
+        if self._cur_role == "__param__" and (final or len(buf) > pos):
+            pass  # 参数值可能还没收完,延后
+
+        yield from out
+
+    def _append_text(self, text: str) -> None:
+        if not text:
+            return
+        cur = self._fields.get("__in__") if self._cur_role == "__param__" else None
+        if self._cur_role == "__param__":
+            self._fields["__value__"] = self._fields.get("__value__", "") + text
+        elif self._cur_role is None:
+            # 版本头等前置内容,丢弃
+            return
         else:
-            content_parts.append(field)
+            name = self._fields.get("__in__")
+            if name:
+                self._fields[name] = self._fields.get(name, "") + text
+            else:
+                self._parts.append(text)
 
-    if content_parts:
-        msg["content"] = _unescape(FIELD_SEP.join(content_parts))
-    elif "tool_calls" in msg:
-        # 只有工具调用的 assistant 消息,content 显式给 None 更符合协议
-        msg["content"] = None
-    else:
-        msg["content"] = ""
+    def _flush_message(self) -> List[Event]:
+        if self._cur_role is None:
+            return []
+        role = self._cur_role
+        parts, fields = self._parts, self._fields
+        self._cur_role = None
+        self._parts = []
+        self._fields = {}
+        if role == "__param__":
+            name = fields.get("__name__", "")
+            raw = fields.get("__value__", "")
+            try:
+                return [(EventKind.PARAM, (name, json.loads(raw)))]
+            except ValueError:
+                return []
+        return [(EventKind.MESSAGE_END, _build_message(role, parts, fields))]
+
+
+def _build_message(role: str, parts: List[str], fields: Dict[str, str]) -> Dict[str, Any]:
+    """把累积的正文与字段组装成一条 message。
+
+    正文按 JSON 字符串读回(见 :func:`iter_message_events` 的说明)。
+    """
+    msg: Dict[str, Any] = {"role": role}
+    raw_content = "".join(parts)
+    if raw_content:
+        try:
+            msg["content"] = json.loads(raw_content)
+        except ValueError:
+            msg["content"] = raw_content    # 容错:非 JSON 时按原样
+    # 其余情况先不写 content,由 extra.__content__ 决定(缺失 / None / 空串)
+
+    if "tool_calls" in fields:
+        msg["tool_calls"] = _parse_tool_calls(fields["tool_calls"])
+    if "tool_call_id" in fields:
+        try:
+            msg["tool_call_id"] = json.loads(fields["tool_call_id"])
+        except ValueError:
+            msg["tool_call_id"] = fields["tool_call_id"]
+    if "name" in fields:
+        try:
+            msg["name"] = json.loads(fields["name"])
+        except ValueError:
+            msg["name"] = fields["name"]
+    if "extra" in fields:
+        try:
+            extra = json.loads(fields["extra"])
+        except ValueError:
+            extra = {}
+        # __content__ 记录的是"原文有没有 content、值是什么",优先级最高
+        has_content = "__content__" in extra
+        saved = extra.pop("__content__", None)
+        msg.update(extra)
+        if has_content and "content" not in msg and saved != _MISSING:
+            msg["content"] = saved          # None 或空串
+        # saved 是 _MISSING:原文没有 content 键,不写
     return msg
 
 
-def _parse_tool_calls(text: str) -> List[Dict[str, Any]]:
-    """把 ``name(args)`` 列表还原成 tool_calls 结构。"""
-    calls: List[Dict[str, Any]] = []
-    for item in text.split(FIELD_SEP):
-        if not item:
-            continue
-        paren = item.find("(")
-        if paren < 0 or not item.endswith(")"):
-            calls.append({"type": "function",
-                          "function": {"name": item, "arguments": "{}"}})
-            continue
-        name = item[:paren]
-        args = item[paren + 1:-1]
-        calls.append({"type": "function",
-                      "function": {"name": name, "arguments": args}})
+def _parse_tool_calls(text: str) -> Any:
+    """还原 tool_calls:就是一段确定性 JSON,直接 loads。
+
+    arguments 回填成字符串(OpenAI 规定的形态),与客户端原始请求对齐。
+    """
+    calls = json.loads(text)
+    if isinstance(calls, list):
+        for call in calls:
+            fn = call.get("function") if isinstance(call, dict) else None
+            if isinstance(fn, dict) and not isinstance(fn.get("arguments"), str):
+                fn["arguments"] = _dumps(fn.get("arguments") or {})
     return calls
 
 
-# ---------------------------------------------------------------------------
-# 便捷入口:bytes ⇄ bytes(给 Encoder 用)
-# ---------------------------------------------------------------------------
+def unrender_request(text: bytes) -> Dict[str, Any]:
+    """:class:`RenderParser` 的一次性版本(测试用)。"""
+    parser = RenderParser()
+    payload: Dict[str, Any] = {}
+    messages: List[Dict[str, Any]] = []
+    for event in list(parser.feed(text)) + list(parser.finish()):
+        kind, value = event
+        if kind == EventKind.MESSAGE_END and isinstance(value, dict):
+            messages.append(value)
+        elif kind == EventKind.PARAM:
+            payload[value[0]] = value[1]
+    if messages:
+        payload["messages"] = messages
+    return payload
+
 
 def messages_to_text(raw_json: bytes) -> bytes:
-    """请求体 JSON 字节 → 渲染文本字节。"""
     return render_request(json.loads(raw_json))
 
 
 def text_to_messages(text: bytes) -> bytes:
-    """渲染文本字节 → 请求体 JSON 字节。"""
     return json.dumps(unrender_request(text), ensure_ascii=False,
                       separators=(",", ":")).encode("utf-8")

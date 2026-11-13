@@ -7,7 +7,7 @@
 
 新方案存的是**扁平块集合**::
 
-    blk:{block_id} → 块字节
+    blk:{block_hash} → 块字节
 
 **顺序不存进存储,而是由请求里的帧序列直接表达。** 一次请求的块顺序在
 帧流里是显式的,网关边解边拼即可。因此:
@@ -35,7 +35,7 @@ import os
 import time
 from typing import Dict, Iterable, List, Optional
 
-from .chunking import BLOCK_ID_SIZE, block_id
+from .chunking import BLOCK_ID_SIZE
 from .codec import BlockSource
 
 #: 块 key 前缀
@@ -44,6 +44,19 @@ KEY_PREFIX = b"blk:"
 
 def _key(bid: bytes) -> bytes:
     return KEY_PREFIX + bid
+
+
+def _blocks_of(text: bytes) -> Dict[bytes, bytes]:
+    """文本 → ``{block_hash: 块字节}``。按 vLLM 规则只收**满块**。
+
+    不满的尾块内容还会被后续追加改变,缓存它没有意义。
+    """
+    from .chunking import blocked_hashes, split
+    out: Dict[bytes, bytes] = {}
+    for (bid, full), (s, e) in zip(blocked_hashes(text), split(text)):
+        if full:
+            out[bid] = text[s:e]
+    return out
 
 
 class DbmStorage(BlockSource):
@@ -71,15 +84,15 @@ class DbmStorage(BlockSource):
 
     # -- BlockSource ------------------------------------------------------
 
-    def get_many(self, block_ids: List[bytes]) -> Dict[bytes, bytes]:
+    def get_many(self, block_hashes: List[bytes]) -> Dict[bytes, bytes]:
         out: Dict[bytes, bytes] = {}
-        for bid in block_ids:
+        for bh in block_hashes:
             try:
-                val = self._db.get(_key(bid))
+                val = self._db.get(_key(bh))
             except KeyError:
                 continue
             if val is not None:
-                out[bid] = bytes(val)
+                out[bh] = bytes(val)
         return out
 
     # -- 写入 -------------------------------------------------------------
@@ -90,12 +103,9 @@ class DbmStorage(BlockSource):
 
     def put_text(self, text: bytes) -> int:
         """把一段文本切块后全部写入。返回写入的块数。"""
-        from .chunking import split_blocks
-        n = 0
-        for chunk in split_blocks(text):
-            self._db[_key(block_id(chunk))] = chunk
-            n += 1
-        return n
+        blocks = _blocks_of(text)
+        self.put_many(blocks)
+        return len(blocks)
 
     def __len__(self) -> int:
         return sum(1 for k in self._db.keys() if k.startswith(KEY_PREFIX))
@@ -137,12 +147,12 @@ class RedisStorage(BlockSource):
     def _key(self, bid: bytes) -> bytes:
         return self._ns + _key(bid)
 
-    def get_many(self, block_ids: List[bytes]) -> Dict[bytes, bytes]:
-        if not block_ids:
+    def get_many(self, block_hashes: List[bytes]) -> Dict[bytes, bytes]:
+        if not block_hashes:
             return {}
-        keys = [self._key(bid) for bid in block_ids]
+        keys = [self._key(bh) for bh in block_hashes]
         values = self._client.mget(keys)
-        return {bid: bytes(v) for bid, v in zip(block_ids, values) if v is not None}
+        return {bh: bytes(v) for bh, v in zip(block_hashes, values) if v is not None}
 
     def put_many(self, blocks: Dict[bytes, bytes]) -> None:
         if not blocks:
@@ -156,8 +166,7 @@ class RedisStorage(BlockSource):
         pipe.execute()
 
     def put_text(self, text: bytes) -> int:
-        from .chunking import split_blocks
-        blocks = {block_id(c): c for c in split_blocks(text)}
+        blocks = _blocks_of(text)
         self.put_many(blocks)
         return len(blocks)
 
@@ -179,17 +188,17 @@ class MemoryStorage(BlockSource):
         self._order: List[bytes] = []
         self._capacity = capacity
 
-    def get_many(self, block_ids: List[bytes]) -> Dict[bytes, bytes]:
+    def get_many(self, block_hashes: List[bytes]) -> Dict[bytes, bytes]:
         out: Dict[bytes, bytes] = {}
-        for bid in block_ids:
-            if bid in self._data:
-                out[bid] = self._data[bid]
+        for bh in block_hashes:
+            if bh in self._data:
+                out[bh] = self._data[bh]
                 # 触摸:移到末尾
                 try:
-                    self._order.remove(bid)
+                    self._order.remove(bh)
                 except ValueError:
                     pass
-                self._order.append(bid)
+                self._order.append(bh)
         return out
 
     def put_many(self, blocks: Dict[bytes, bytes]) -> None:
@@ -202,8 +211,7 @@ class MemoryStorage(BlockSource):
             self._data.pop(evict, None)
 
     def put_text(self, text: bytes) -> int:
-        from .chunking import split_blocks
-        blocks = {block_id(c): c for c in split_blocks(text)}
+        blocks = _blocks_of(text)
         self.put_many(blocks)
         return len(blocks)
 

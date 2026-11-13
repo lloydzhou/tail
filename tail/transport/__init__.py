@@ -4,7 +4,7 @@
 
     render.py    渲染器 / 反渲染器   懂 LLM 语义   messages JSON ⇄ 一维文本
     codec.py     编码器 / 解码器     只认字节      一维文本 ⇄ 帧流
-    chunking.py  CDC 分块 + 块 id    只认字节      字节 → 块列表
+    chunking.py  定长块 + 块哈希      只认字节      字节 → 块列表
     frames.py    帧格式              只认字节      帧 ⇄ 字节流
     storage.py   块存储              只认块        扁平块集合
     gateway.py   串起来的请求路径

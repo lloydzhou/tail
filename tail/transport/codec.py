@@ -1,30 +1,30 @@
 """编码器 / 解码器:文本字节流 ⇄ 帧流。
 
-**这两层完全不认识聊天协议。** 它们只看到字节:按 CDC 切块、算 block_id、
-查缓存决定发引用帧还是新块帧。换成任何其他格式的转换器,这两层一行都不用改。
+**这两层完全不认识聊天协议。** 它们只看到字节:按 vLLM 的定长 block_size
+切块、查缓存决定发引用帧还是新块帧。换成任何其他格式的转换器,这两层一行都
+不用改。
 
-这是本方案与原 v2.1 方案的本质区别:原方案里网关要理解 role / system / tools
-的位置和结构,任何协议变化都要改缓存逻辑;现在缓存逻辑只认字节。
+**两层都是流式的。** 文本片段进、帧片段出,不需要先把完整文本拼出来。
+内存占用只与「单个块」的大小成正比,与请求体总大小无关。
 
-数据流(上行):
+数据流(上行)::
 
-    文本字节流
-      → 按 CDC 切块
-        → 每块算 block_id
-          → 客户端本地已知该 id  → 发引用帧(17 字节)
-          → 未知                  → 发新块帧(内容直传)
-            → 追加 END
+    渲染文本片段流
+      → 累积到够一个块 → 算 block_hash
+          → 客户端已知该 id  → 发引用帧(17 字节)
+          → 未知              → 发新块帧(内容直传)
+            → 流结束时冲刷尾块,追加 END
 
-数据流(下行,网关侧):
+数据流(下行,网关侧)::
 
-    帧流(增量喂入)
+    帧流片段(增量喂入)
       → 引用帧:从存储取块内容
       → 新块帧:内容直传
-        → 按到达顺序拼成一维文本流
-          → 交给反渲染器
+        → 按到达顺序产出文本片段
+          → 交给流式反渲染器
 
-**退化保证**:任何一块取不到,就退化为"整段文本直传"而不是报错。缓存全空、
-存储挂掉、服务重启时系统仍能正常工作,只是没有去重收益。
+退化保证:任何一块取不到,解码器记录到 ``missing`` 并跳过,调用方据此
+让客户端重发全文。缓存全空、存储挂掉、服务重启时系统仍能正常工作。
 """
 
 from __future__ import annotations
@@ -40,59 +40,84 @@ from .frames import Frame
 # ---------------------------------------------------------------------------
 
 class Encoder:
-    """把一整段文本编码成帧流。
+    """把渲染文本编码成帧流。
 
     客户端需要维护一个「已知块 id 集合」——即对端(网关/存储)已经有的块。
     只发未知块的内容,已知块只发引用。
 
-    这个集合的维护策略:
+    集合的维护策略:
       - 首次请求:集合为空,全部发新块帧(冷启动)
-      - 收到响应后:把本次发过的块 id 加入集合(对端已存下)
+      - 编码过后:把本次发过的块 id 加入集合(对端已存下)
       - 进程重启后集合丢失:退化为冷启动,仍能正常完成
-
-    也可以只存 id 不存内容(省内存),此时无法离线重建完整请求。
     """
 
-    def __init__(self, known: Optional[Iterable[bytes]] = None) -> None:
+    def __init__(self, known: Optional[Iterable[bytes]] = None,
+                 block_size: int = chunking.BLOCK_SIZE) -> None:
         self._known = set(known or ())
+        self._block_size = block_size
 
     @property
     def known_count(self) -> int:
         return len(self._known)
 
+    def iter_encode(self, text_pieces: Iterable[bytes]) -> Iterator[bytes]:
+        """流式编码:喂文本片段流,产出帧流片段。"""
+        hasher = chunking.BlockHasher(self._block_size)
+        for piece in text_pieces:
+            for bid, block in hasher.feed(piece):
+                yield self._encode_block(bid, block)
+        for bid, block in hasher.flush():
+            yield self._encode_block(bid, block)
+        yield frames.encode_end()
+
+    def iter_encode_events(self, events) -> Iterator[bytes]:
+        """流式编码**事件流**。
+
+        事件经 ``event_to_bytes`` 转成字节后直接喂给 :class:`BlockHasher`——
+        切块只看字节,不看事件边界(与 vLLM 的 block_size 对齐方式一致)。
+        编码器不需要认识任何渲染标记。
+        """
+        from .render import EventKind, event_to_bytes
+
+        hasher = chunking.BlockHasher(self._block_size)
+        for kind, payload in events:
+            for piece in event_to_bytes((kind, payload)):
+                for bid, block in hasher.feed(piece):
+                    yield self._encode_block(bid, block)
+        for bid, block in hasher.flush():
+            yield self._encode_block(bid, block)
+        yield frames.encode_end()
+
+    def _encode_block(self, block_hash: bytes, block: bytes) -> bytes:
+        """已知块发引用帧,否则发新块帧(帧里带哈希)。"""
+        if block_hash in self._known:
+            return frames.encode_ref(block_hash)
+        self._known.add(block_hash)
+        return frames.encode_new(block_hash, block)
+
     def encode(self, text: bytes) -> bytes:
-        """把完整文本编码成帧流字节。"""
-        out = bytearray()
-        for chunk in chunking.split_blocks(text):
-            bid = chunking.block_id(chunk)
-            if bid in self._known:
-                out += frames.encode_ref(bid)
-            else:
-                out += frames.encode_new(chunk)
-                self._known.add(bid)
-        out += frames.encode_end()
-        return bytes(out)
+        """一次性编码。测试与短请求用;生产路径用 :meth:`iter_encode`。"""
+        return b"".join(self.iter_encode([text]))
 
     def encode_frames(self, text: bytes) -> List[Frame]:
         """编码成帧列表(测试/调试用)。"""
         out: List[Frame] = []
-        for chunk in chunking.split_blocks(text):
-            bid = chunking.block_id(chunk)
-            if bid in self._known:
-                out.append(("ref", bid))
+        for block_hash, block in chunking.blocked_to_blocks(text):
+            if block_hash in self._known:
+                out.append(("ref", block_hash))
             else:
-                out.append(("new", chunk))
-                self._known.add(bid)
+                out.append(("new", (block_hash, block)))
+                self._known.add(block_hash)
         return out
 
-    def forget(self, block_ids: Iterable[bytes]) -> None:
+    def forget(self, block_hashes: Iterable[bytes]) -> None:
         """把块从已知集合里移除(缓存被淘汰、存储不可用时调用)。
 
         下一轮这些块会被当新块重发。**不需要任何补发协议**——
-        新块帧本身就带完整内容,这一点是扁平块集合设计的好处。
+        新块帧本身就带完整内容,这是扁平块集合设计的好处。
         """
-        for bid in block_ids:
-            self._known.discard(bid)
+        for bh in block_hashes:
+            self._known.discard(bh)
 
     def clear(self) -> None:
         self._known.clear()
@@ -105,19 +130,19 @@ class Encoder:
 class MissingBlock(Exception):
     """引用帧指向的块在存储里不存在。
 
-    这是**可恢复**的:调用方应退化为让客户端重发全文,而不是返回错误给用户。
+    这是**可恢复**的:调用方应让客户端重发全文,而不是返回错误给用户。
     正常情况下不会发生(客户端只引用自己发过的块),除非存储被淘汰或重启。
     """
 
-    def __init__(self, block_id: bytes) -> None:
-        super().__init__(f"块不存在: {block_id.hex()}")
-        self.block_id = block_id
+    def __init__(self, block_hash: bytes) -> None:
+        super().__init__(f"块不存在: {block_hash.hex()}")
+        self.block_hash = block_hash
 
 
 class BlockSource:
     """块内容来源的抽象。网关侧由存储实现它。"""
 
-    def get_many(self, block_ids: List[bytes]) -> Dict[bytes, bytes]:
+    def get_many(self, block_hashes: List[bytes]) -> Dict[bytes, bytes]:
         """批量取块。返回 id → 内容,缺失的 id 不出现在结果里。"""
         raise NotImplementedError
 
@@ -128,8 +153,8 @@ class DictBlockSource(BlockSource):
     def __init__(self, data: Optional[Dict[bytes, bytes]] = None) -> None:
         self._data = dict(data or {})
 
-    def get_many(self, block_ids: List[bytes]) -> Dict[bytes, bytes]:
-        return {bid: self._data[bid] for bid in block_ids if bid in self._data}
+    def get_many(self, block_hashes: List[bytes]) -> Dict[bytes, bytes]:
+        return {bh: self._data[bh] for bh in block_hashes if bh in self._data}
 
     def put_many(self, blocks: Dict[bytes, bytes]) -> None:
         self._data.update(blocks)
@@ -141,23 +166,27 @@ class DictBlockSource(BlockSource):
 class NullBlockSource(BlockSource):
     """什么都取不到。用于"缓存完全不可用"的降级路径。"""
 
-    def get_many(self, block_ids: List[bytes]) -> Dict[bytes, bytes]:
+    def get_many(self, block_hashes: List[bytes]) -> Dict[bytes, bytes]:
         return {}
 
 
 class Decoder:
-    """增量式解码:边收帧边拼文本,不构造完整对象。
+    """**流式**解码:边收帧边产出文本片段,不构造完整对象。
 
-    内存占用与「单块大小」成正比,与请求体总大小无关——这是流式的关键。
+    内存占用与「单块大小」成正比,与请求体总大小无关。
 
     用法::
 
         dec = Decoder(source)
-        for chunk in body_chunks:
-            for piece in dec.feed(chunk):
-                send_downstream(piece)     # 边解边转发
+        for body_chunk in body_chunks:
+            for text_piece in dec.feed(body_chunk):
+                forward(text_piece)      # 边解边转发
         dec.finish()
+        if dec.missing: retransmit()
     """
+
+    __slots__ = ("_frames", "_source", "_strict", "_on_new_block",
+                 "missing", "new_blocks", "ref_count", "unresolved", "_closed")
 
     def __init__(self, source: BlockSource,
                  strict: bool = False,
@@ -166,8 +195,8 @@ class Decoder:
         Args:
           source: 块内容来源
           strict: True 时缺块抛 :class:`MissingBlock`;False 时记录到
-                  :attr:`missing` 并跳过(调用方据此决定是否要求全文重传)
-          on_new_block: 收到新块帧时的回调 ``(block_id, content)``,
+                  :attr:`missing` 并跳过
+          on_new_block: 收到新块帧时的回调 ``(block_hash, content)``,
                         用于把新块写入存储
         """
         self._frames = frames.FrameDecoder()
@@ -175,8 +204,9 @@ class Decoder:
         self._strict = strict
         self._on_new_block = on_new_block
         self.missing: List[bytes] = []
+        self.unresolved: List[bytes] = []   # 本轮尚不能确定是否缺失的引用帧
         self.new_blocks: Dict[bytes, bytes] = {}
-        self.ref_count = 0          # 成功解出的引用帧数量
+        self.ref_count = 0
         self._closed = False
 
     def feed(self, data: bytes) -> Iterator[bytes]:
@@ -185,20 +215,18 @@ class Decoder:
             return
         for kind, payload in self._frames.feed(data):
             if kind == "new":
-                # payload 是新块内容
-                bid = chunking.block_id(payload)
-                self.new_blocks[bid] = payload
+                # 块哈希由发送方算好随帧传来(哈希链依赖父哈希,解码端算不出)
+                bh, content = payload
+                self.new_blocks[bh] = content
                 if self._on_new_block is not None:
-                    self._on_new_block(bid, payload)
-                yield payload
+                    self._on_new_block(bh, content)
+                yield content
             else:
-                # payload 是 block_id。先看本轮新块,再看存储。
                 bid = payload
                 self.ref_count += 1
                 content = self.new_blocks.get(bid)
                 if content is None:
-                    got = self._source.get_many([bid])
-                    content = got.get(bid)
+                    content = self._source.get_many([bid]).get(bid)
                 if content is None:
                     self.missing.append(bid)
                     if self._strict:
@@ -237,5 +265,10 @@ def encode_text(text: bytes, known: Optional[Iterable[bytes]] = None) -> bytes:
 
 
 def collect_blocks(text: bytes) -> Dict[bytes, bytes]:
-    """把文本切成块并返回 id → 内容。网关写入存储时用。"""
-    return {chunking.block_id(c): c for c in chunking.split_blocks(text)}
+    """把文本切成块并返回 ``block_hash → 内容``(只含满块)。
+
+    与 vLLM 的 "only cache full blocks" 一致。复用 storage 的实现,
+    避免两处各写一遍"只存满块"的规则。
+    """
+    from .storage import _blocks_of
+    return _blocks_of(text)

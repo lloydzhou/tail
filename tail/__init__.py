@@ -11,7 +11,7 @@
     messages JSON                            帧流
       ↓ 渲染器 (render)                        ↓ 解码器 (codec.Decoder)
     一维文本流                                一维文本流
-      ↓ CDC 分块 + 引用/新块决策                 ↓ 反渲染器 (render)
+      ↓ 定长分块 + 引用/新块决策                 ↓ 反渲染器 (render)
     帧流 ────────── 公网 ──────────→           messages JSON
                                                  ↓
                                               上游推理 API
