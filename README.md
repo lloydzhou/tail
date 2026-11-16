@@ -359,6 +359,27 @@ MAGPIE_TAIL=1 magpie serve         # gateway 开关：接受 application/x-tail-
 客户端」——不是本地使用偏好。同一个人的本地 magpie 开着客户端、集群 magpie 开着
 服务端，两边都不需要改配置文件。
 
+**发第一个尾巴之前先握手。** tail 请求体不是 JSON，所以「对端到底接不接得住」不能
+靠试：直接发到一个不认识的服务器，会每轮 400/415（走进「上游出错」的处理链），或者
+更糟——对方不读 body 直接回 200，agent 拿到一段没看过上下文的回复，日志里却什么都
+不报。于是 egress 先对**它自己要 POST 的那个 URL** 发一次 `OPTIONS`：
+
+```
+OPTIONS {chat base}/chat/completions
+  → 204, Allow: POST, OPTIONS
+    X-Tail-Version: 3
+    X-Tail-Block: 512
+```
+
+只有应答里同时给了版本和块大小才算「支持」；没 OPTIONS、版本不同、块大小不同、或
+中间有代理代答，一律按不支持处理，该 provider 永远发普通 JSON——与这套传输不存在时
+逐字节一致。所以**部署顺序不要紧**：可以先给 provider 加 `tail=on`，再升级对端，
+中间那段时间只是没省到字节，请求本身不会坏。
+
+> Python 参考实现（`tail/proxy.py`）还没有这段握手，它假定对端一定支持该协议；
+> 指到不支持的地址时仍然是每轮失败的旧行为。要接真实 magpie 之外的远端，请用
+> magpie 的 Go 实现，或按同样的 `OPTIONS` 语义自己加一次探测。
+
 **本地侧的 magpie（把 provider 指过去，加一个 `tail=on`）**
 
 ```bash
