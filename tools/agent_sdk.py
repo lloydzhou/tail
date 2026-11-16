@@ -4,21 +4,22 @@
 就是这个)对着**本地那个 magpie** 说话,让它自己决定怎么把请求发到远端:
 
     openai.OpenAI  ──▶  magpie(本地)  ──▶  限速链路  ──▶  magpie(集群) ──▶ 推理服务
-                        ├── provider plain
-                        └── provider tail=on
+                        └── provider peer(一个)
 
-客户端代码两种模式**一字不差**,只有 `model=` 里的 provider 名不同:
+客户端代码两趟**一字不差**,`model=` 也一样 —— 变的是本地 magpie 的 tail 插件开关
+(`magpie plugin builtin on|off tail`,默认开):
 
     client = OpenAI(base_url="http://127.0.0.1:PORT/v1", api_key="magpie")
-    stream = client.chat.completions.create(model="plain/<upstream>" …)
-    stream = client.chat.completions.create(model="tail/<upstream>"  …)
+    stream = client.chat.completions.create(model="peer/<upstream>" …)   # 开关 off
+    magpie plugin builtin on tail                                        # 开关 on
+    stream = client.chat.completions.create(model="peer/<upstream>" …)   # 开关 on
 
-这正好回答「我把 api 接到哪个 agent 使用其实没有区别」:SDK 侧零改动,省的是两个
-magpie 之间那一段。
+这正好回答「我把 api 接到那个 agent 使用其实没有区别」:SDK 侧零改动(连 model 都
+不用换),省的是两个 magpie 之间那一段。
 
 用法::
 
-    .venv/bin/python -m tools.agent_sdk --magpie /tmp/magpie-tail --rounds 8 --mbps 25
+    .venv/bin/python -m tools.agent_sdk --magpie /tmp/magpie-panel --rounds 8 --mbps 25
 """
 
 from __future__ import annotations
@@ -36,7 +37,7 @@ import httpx2 as httpx
 
 from .link import ThrottledRelay, upload_seconds
 from .magpie_pair import Server, _free_port
-from .realworld import Magpie, _kb, _mb
+from .realworld import Magpie, _kb, _mb, _switch
 from .traffic import Turn, build_trace
 
 from openai import OpenAI
@@ -117,7 +118,7 @@ def main() -> None:
         print(f"轨迹:{len(trace)} 轮,均纯追加 {trace.kinds()}")
 
         cluster.provider("mock", f"http://127.0.0.1:{backend_port}/v1",
-                         "deepseek-chat", tail=False)
+                         "deepseek-chat")
         cluster.start()
         cluster.wait()
         cluster_model = [m for m in cluster.models() if m.startswith("mock/")][0]
@@ -128,33 +129,33 @@ def main() -> None:
         relay.start()
         peer = f"http://127.0.0.1:{relay.port}/v1"
 
+        # 一个 provider。plain 与 tail 的区别只在本地网关的 tail 插件开关。
         local = Magpie(args.magpie, os.path.join(root, "local"),
-                       f"127.0.0.1:{_free_port()}")
-        local.provider("plain", peer, cluster_model, tail=False)
-        local.provider("tail", peer, cluster_model, tail=True)
+                       f"127.0.0.1:{_free_port()}", tail=False)
+        local.provider("peer", peer, cluster_model)
         local.start()
         local.wait()
-        models = local.models()
-        plain_model = [m for m in models if m.startswith("plain/")][0]
-        tail_model = [m for m in models if m.startswith("tail/")][0]
+        model = [m for m in local.models() if m.startswith("peer/")][0]
 
         base_url = f"http://{local.addr}/v1"
-        print(f"openai SDK → {base_url},模型 {plain_model} / {tail_model},"
-              f"链路 {args.mbps} Mbps")
+        print(f"openai SDK → {base_url},模型 {model},"
+              f"链路 {args.mbps} Mbps,tail 插件 {_switch(local)}")
 
-        # 客户端代码一字不差,只有 model 不同
+        # 客户端代码一字不差:model 也一样,只翻本地网关的开关
         client = make_client(base_url)
-        print("\n[1/2] plain…")
-        plain = run_pass(client, plain_model, trace, relay)
-        print("[2/2] tail…")
-        tail = run_pass(client, tail_model, trace, relay)
+        print("\n[1/2] plain:tail 插件 **关**…")
+        plain = run_pass(client, model, trace, relay)
+        local.switch(True)          # 唯一要翻的东西
+        local.prewarm()             # 把「对端支不支持」那一问提前问掉
+        print("[2/2] tail:同一个客户端、同一个 model,tail 插件 **开**…")
+        tail = run_pass(client, model, trace, relay)
 
         seen = backend.state.received[-2 * len(trace):]
         if len(seen) == 2 * len(trace):
             for i, (a, b) in enumerate(zip(seen[:len(trace)], seen[len(trace):])):
                 if a["messages"] != b["messages"]:
                     raise AssertionError(f"第 {i+1} 轮:两条路的消息不一致")
-            print("\n推理服务收到的 messages 两条路逐轮一致 ✓")
+            print("\n两趟(开关关 / 开关开)推理服务收到的 messages 逐轮一致 ✓")
 
         print()
         print("=" * 84)

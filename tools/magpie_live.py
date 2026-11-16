@@ -10,6 +10,9 @@
 
 - 集群侧:一个真正的 magpie gateway,provider 指向推理服务(这里用 mock 推理服务,
   真实环境换成 api.deepseek.com 之类的 chat completions 上游即可)。
+- 两边的 magpie 都把内置插件 `tail` **关掉**(`magpie plugin builtin off tail`):
+  tail 在这条链路里由 Python 的 `tail.serve` / `tail.proxy` 两个进程实现,
+  magpie 自己的那套不参与,关掉才量得准。
 - 本地侧:一个真正的 magpie gateway,两个 provider ——
   ``direct`` 直连集群 magpie,``tail`` 指向本地 tail 代理(再经 tail 网关到集群 magpie)。
 - 两次请求体完全一样,只有 ``model`` 前面的 provider 名不同,所以「magpie 会怎么改写
@@ -54,12 +57,17 @@ from .magpie_pair import Session, Server, _free_port, _kb, _mb, render_bytes
 # ---------------------------------------------------------------------------
 
 class Magpie:
-    """一个真实的 magpie gateway 进程(临时配置目录)。"""
+    """一个真实的 magpie gateway 进程(临时配置目录)。
 
-    def __init__(self, binary: str, root: str, addr: str) -> None:
+    这里的 tail 由 Python 的 ``tail.serve`` / ``tail.proxy`` 实现,magpie 自己的
+    内置插件 ``tail`` 只是要关掉 —— 它默认是开的,开着会去问对端 OPTIONS。
+    """
+
+    def __init__(self, binary: str, root: str, addr: str, tail: bool = False) -> None:
         self.binary = binary
         self.root = root
         self.addr = addr
+        self.tail = tail
         self.proc: Optional[subprocess.Popen] = None
         os.makedirs(os.path.join(root, "config"), exist_ok=True)
         os.makedirs(os.path.join(root, "cache"), exist_ok=True)
@@ -71,6 +79,17 @@ class Magpie:
         e["MAGPIE_ADDR"] = self.addr
         return e
 
+    def switch(self, on: bool) -> None:
+        """写内置插件 tail 的开关(这个工具里两边都关着)。"""
+        out = subprocess.run(
+            [self.binary, "plugin", "builtin", "on" if on else "off", "tail"],
+            env=self.env(), capture_output=True, text=True, timeout=120)
+        if out.returncode != 0:
+            raise RuntimeError(
+                f"magpie plugin builtin {'on' if on else 'off'} tail 失败: "
+                f"{out.stderr or out.stdout}")
+        self.tail = on
+
     def provider(self, name: str, url: str, model: str) -> None:
         out = subprocess.run(
             [self.binary, "provider", "add", name, f"url={url}",
@@ -80,6 +99,7 @@ class Magpie:
             raise RuntimeError(f"magpie provider add {name} 失败: {out.stderr or out.stdout}")
 
     def start(self) -> None:
+        self.switch(self.tail)      # 起之前把开关写进 plugins.yml
         self.proc = subprocess.Popen([self.binary, "serve"], env=self.env(),
                                      stdout=subprocess.DEVNULL,
                                      stderr=subprocess.DEVNULL)

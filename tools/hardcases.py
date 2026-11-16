@@ -20,7 +20,7 @@ Session,请求交错甚至并行;网关也会重启(升级、崩、被调度器�
 
 用法::
 
-    .venv/bin/python -m tools.hardcases --magpie /tmp/magpie-tail --check all
+    .venv/bin/python -m tools.hardcases --magpie /tmp/magpie-panel --check all
 """
 
 from __future__ import annotations
@@ -40,7 +40,7 @@ import httpx2 as httpx
 
 from .link import ThrottledRelay
 from .magpie_pair import Server, _free_port
-from .realworld import Magpie
+from .realworld import Magpie, _switch
 from .traffic import AgentSession, payload_bytes
 
 
@@ -69,7 +69,7 @@ def ask(url: str, model: str, session: AgentSession, stream: bool = False) -> Di
 # 检查 1+2:并发会话 / 乱序响应
 # ---------------------------------------------------------------------------
 
-def check_parallel_sessions(url: str, tail_model: str, received: List[Dict],
+def check_parallel_sessions(url: str, model: str, received: List[Dict],
                             base: int, n_sessions: int, rounds: int) -> Dict:
     """N 个会话各跑几轮,全部并发,验证不串台、每条都完整。"""
     sessions = [AgentSession(seed=7000 + i, turn_kb=12) for i in range(n_sessions)]
@@ -84,7 +84,7 @@ def check_parallel_sessions(url: str, tail_model: str, received: List[Dict],
     def worker(idx: int) -> None:
         s = sessions[idx % n_sessions]
         try:
-            ask(url, tail_model, s)
+            ask(url, model, s)
         except Exception as exc:                # noqa: BLE001 — 收集起来一起报
             errors.append(f"session {idx}: {exc}")
 
@@ -147,8 +147,8 @@ def _measure_upload(url: str, model: str, session: AgentSession,
     return sum(w.up_bytes for w in windows)
 
 
-def check_out_of_order(url: str, plain_model: str, tail_model: str,
-                       relay: "ThrottledRelay", rounds: int) -> Dict:
+def check_out_of_order(url: str, model: str, relay: "ThrottledRelay", rounds: int,
+                       local: Magpie) -> Dict:
     """同一会话的多个请求同时在飞,且**最早(历史最短)的那个最后回来**。
 
     凭据表每个会话留 4 条(`maxCredentials`)就是为了这个。只留 1 条的话,
@@ -170,7 +170,7 @@ def check_out_of_order(url: str, plain_model: str, tail_model: str,
     payloads: List[bytes] = []
     for _ in range(n_rounds):
         session.append_turn()
-        payloads.append(payload_bytes(payload(tail_model, session.messages)))
+        payloads.append(payload_bytes(payload(model, session.messages)))
 
     errors: List[str] = []
 
@@ -191,11 +191,14 @@ def check_out_of_order(url: str, plain_model: str, tail_model: str,
         list(pool.map(lambda i: fire(i, stagger[i]), range(n_rounds)))
     relay.take_windows(gap=0.05, settle=0.6)     # 并发阶段的不算数,量之前会排空
 
-    # 串行再发一轮,实测上行字节
+    # 串行再发一轮,实测上行字节:同一份请求体,开关开量一次、关量一次
     session.append_turn()
-    body = payload_bytes(payload(tail_model, session.messages))
-    measured = _measure_upload(url, tail_model, session, relay)
-    plain_up = _measure_upload(url, plain_model, session, relay)
+    body = payload_bytes(payload(model, session.messages))
+    measured = _measure_upload(url, model, session, relay)
+    local.switch(False)                          # 同一个 provider,关掉开关
+    plain_up = _measure_upload(url, model, session, relay)
+    local.switch(True)                           # 翻回来,后面的检查还要用尾巴
+    local.prewarm()
 
     # 算术基准:这一轮能复用的前缀,就是**上一轮(最长那份)响应确认过的**长度,
     # 即上一轮渲染正文向下取整到 512 的块边界。
@@ -233,7 +236,7 @@ def check_out_of_order(url: str, plain_model: str, tail_model: str,
 # 检查 3:网关重启
 # ---------------------------------------------------------------------------
 
-def check_restart(cluster: Magpie, url: str, tail_model: str, session: AgentSession,
+def check_restart(cluster: Magpie, url: str, model: str, session: AgentSession,
                   relay: "ThrottledRelay", rounds_before: int,
                   rounds_after: int) -> Dict:
     """跑几轮 → 杀掉集群 magpie 重起(块缓存空了)→ 再跑几轮。
@@ -250,7 +253,7 @@ def check_restart(cluster: Magpie, url: str, tail_model: str, session: AgentSess
 
     for _ in range(rounds_before):
         session.append_turn()
-        ask(url, tail_model, session)
+        ask(url, model, session)
 
     cluster.stop()
     cluster.start()
@@ -262,9 +265,9 @@ def check_restart(cluster: Magpie, url: str, tail_model: str, session: AgentSess
     full_texts: List[int] = []
     for _ in range(rounds_after):
         session.append_turn()
-        body = payload_bytes(payload(tail_model, session.messages))
+        body = payload_bytes(payload(model, session.messages))
         full = len(render_request(json.loads(body)))
-        up = _measure_upload(url, tail_model, session, relay)
+        up = _measure_upload(url, model, session, relay)
         rows.append({"full_text": full, "upload": up})
         full_texts.append(full)
         if up <= full * 0.5:
@@ -317,7 +320,7 @@ def main() -> None:
     local: Optional[Magpie] = None
     try:
         cluster.provider("mock", f"http://127.0.0.1:{backend_port}/v1",
-                         "deepseek-chat", tail=False)
+                         "deepseek-chat")
         cluster.start()
         cluster.wait()
         cluster_model = [m for m in cluster.models() if m.startswith("mock/")][0]
@@ -329,24 +332,25 @@ def main() -> None:
         relay.start()
         peer = f"http://127.0.0.1:{relay.port}/v1"
 
+        # 一个 provider。这里的检查都跑在「tail 插件开着」的状态上;
+        # 只有乱序那条为了拿到 plain 的上行字节,会在中间把开关翻一次再翻回来。
         local = Magpie(args.magpie, os.path.join(root, "local"),
-                       f"127.0.0.1:{_free_port()}")
-        local.provider("plain", peer, cluster_model, tail=False)
-        local.provider("tail", peer, cluster_model, tail=True)
+                       f"127.0.0.1:{_free_port()}", tail=True)
+        local.provider("peer", peer, cluster_model)
         local.start()
         local.wait()
-        models = local.models()
-        plain_model = [m for m in models if m.startswith("plain/")][0]
-        tail_model = [m for m in models if m.startswith("tail/")][0]
+        local.prewarm()
+        model = [m for m in local.models() if m.startswith("peer/")][0]
         url = f"http://{local.addr}/v1/chat/completions"
-        print(f"本地 magpie {local.addr} → 集群 magpie {cluster.addr} → 推理服务")
-        print(f"模型 {tail_model}")
+        print(f"本地 magpie {local.addr}(tail 插件 {_switch(local)}) → "
+              f"集群 magpie {cluster.addr}({_switch(cluster)}) → 推理服务")
+        print(f"模型 {model}")
 
         result: Dict[str, object] = {}
         if args.check in ("all", "parallel"):
             # 用 backend_app.state.received 作为「上游收到了什么」的观测点
             seen = backend_app.state.received
-            out = check_parallel_sessions(url, tail_model, seen, len(seen),
+            out = check_parallel_sessions(url, model, seen, len(seen),
                                           args.sessions, args.rounds)
             result["parallel"] = out
             print(f"\n[并发] {out['sent']} 个请求 / {args.sessions} 个会话并行:"
@@ -356,8 +360,7 @@ def main() -> None:
                 print("  错误示例:", out["errors"][:2])
 
         if args.check in ("all", "outoforder"):
-            out = check_out_of_order(url, plain_model, tail_model, relay,
-                                     args.rounds + 1)
+            out = check_out_of_order(url, model, relay, args.rounds + 1, local)
             result["outoforder"] = out
             print(f"\n[乱序] 同一会话 {out['inflight']} 个请求同时在飞(最短的那个最后回),"
                   f"再串行一轮:")
@@ -371,7 +374,7 @@ def main() -> None:
 
         if args.check in ("all", "restart"):
             session = AgentSession(seed=9999, turn_kb=12)
-            out = check_restart(cluster, url, tail_model, session, relay,
+            out = check_restart(cluster, url, model, session, relay,
                                 rounds_before=3, rounds_after=4)
             result["restart"] = out
             print(f"\n[重启] 集群 magpie 被杀掉重起后,"

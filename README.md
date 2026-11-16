@@ -342,22 +342,31 @@ if resp.headers.get("x-tail-retransmit"):
     client.invalidate()                        # 前缀失效，下一轮重发全文
 ```
 
-### 接 magpie：两个 magpie、各一个开关
+### 接 magpie：一个开关，两端都要开
 
 magpie（Go，本地一个 + 集群一个）里这套传输是原生实现的，不需要旁路进程：
-`internal/tail` 是协议的 Go 实现（渲染/切块/链/存储，与 Python 版本逐字节对拍），
-gateway 的两端各挂一个开关。
+`internal/tail` 是协议的 Go 实现（渲染/切块/链/存储，与 Python 版本逐字节对拍）。
 
-**集群侧的 magpie（出站侧的老大：它接受尾巴字节）**
+**开关只有一个：内置插件 `tail`。** 在窗口里是 Plugins › Built-in › **Tail
+transport** 的开关；在终端里是：
 
 ```bash
-MAGPIE_TAIL=1 magpie serve         # gateway 开关：接受 application/x-tail-v3
+magpie plugin builtin on tail      # 打开
+magpie plugin builtin off tail     # 关掉
+magpie plugin builtin              # 列出所有内置插件：● 开，○ 关
 ```
 
-这个开关放在环境变量里（和 `MAGPIE_ADDR`、`MAGPIE_ALLOW_IPS` 一样），不进
-`settings.json`：它是**某个部署的位置**的属性——「我前面是不是有个会发尾巴的
-客户端」——不是本地使用偏好。同一个人的本地 magpie 开着客户端、集群 magpie 开着
-服务端，两边都不需要改配置文件。
+- **默认是开的。** magpie 的内置插件默认全开，`plugins.yml` 只在用户改过之后才有
+  那一行；新装的 magpie 不需要任何操作就已经能收尾巴，也已经在问对端要不要发。
+- **一个开关管两件事。** 开着，这台 magpie 既**接受**尾巴请求（还原成整包 JSON 再
+  往下走），也对**握手说支持的对端发**尾巴。所以这条链路**两端都要开着**：本地开着
+  才会发，集群开着才会收。关掉就是彻底关掉，两个方向一起回到整包 JSON。
+- **没有 per-provider 配置了。** `provider add` 不再接受 `tail=on`（现在会报
+  `unknown field "tail"`）：走不走 tail 是**对端自己回答**的，不是本地给某个 provider
+  打的标。
+- 面板上还有四个数（`plugins.yml` 里同名）：`capFreshMin` 30、`capAgainMin` 5、
+  `probeSec` 3、`cacheMB` 256（分钟 / 分钟 / 秒 / MB）。它们在下一次打开这个插件或
+  重启 magpie 时生效。
 
 **发第一个尾巴之前先握手。** tail 请求体不是 JSON，所以「对端到底接不接得住」不能
 靠试：直接发到一个不认识的服务器，会每轮 400/415（走进「上游出错」的处理链），或者
@@ -388,21 +397,24 @@ OPTIONS {chat base}/chat/completions
 问的时机还提前了：**列模型时就开始问**（agent 首轮之前必做的事），所以实际上一轮
 往往已经能用上尾巴——两个真实 magpie 实测第 2 轮起就是尾巴（第 1 轮本来也是全量）。
 
-所以**部署顺序不要紧**：可以先给 provider 加 `tail=on`，再升级对端，中间那段时间只是
-没省到字节，请求本身不会坏。
+所以**部署顺序不要紧**：先在一端打开这个插件也行——另一端还没答「支持」的时候，
+它照常发整包 JSON，请求本身不会坏。等那一端也开起来，本地最多 5 分钟就会重问一次，
+尾巴自己开始，不用重启任何进程。反过来先升级、后开开关也一样。
 
 > Python 参考实现（`tail/proxy.py`）还没有这段握手，它假定对端一定支持该协议；
 > 指到不支持的地址时仍然是每轮失败的旧行为。要接真实 magpie 之外的远端，请用
 > magpie 的 Go 实现，或按同样的 `OPTIONS` 语义自己加一次探测。
 
-**本地侧的 magpie（把 provider 指过去，加一个 `tail=on`）**
+**本地侧的 magpie（把 provider 指过去，什么都不用加）**
 
 ```bash
-magpie provider add peer url=http://10.0.0.5:3425/v1 key=sk-… models=… tail=on
+magpie provider add peer url=http://10.0.0.5:3425/v1 key=sk-… models=…
 ```
 
-provider 的 `url=` 还是普通的 chat completions 地址（`…/v1`），`tail=on` 只改变
-「同一个地址怎么发」——所以 A/B 对比就是换一个 provider 名，请求体一模一样。
+provider 的 `url=` 就是普通的 chat completions 地址（`…/v1`）——要不要发尾巴由
+**本机那个开关**决定，跟 provider 无关。所以 A/B 对比是**同一个 provider、同一批
+请求体**，中间只把开关翻一次；`tools/` 里的工具都是这么取数的（下面每张表的
+plain / tail 两列，就是开关 off / on 两趟）。
 
 实测（两个真实 magpie 二进制，中间用计字节的 TCP 中继观测**两个 magpie 之间的
 真实线上字节**，mock 推理服务在集群侧，同一个 agent 会话逐轮变长）：
@@ -492,31 +504,31 @@ go test -run 'TestOutOfOrderRepliesKeepTheLongestPrefix' ./internal/tail/
 恢复如常。也就是说重启不是正确性问题（agent 不会看到 5xx），只是一次性的带宽损失。
 
 ```bash
-python -m tools.hardcases --magpie /tmp/magpie-tail --check all --sessions 4 --rounds 3
+python -m tools.hardcases --magpie /tmp/magpie-panel --check all --sessions 4 --rounds 3
 ```
 
 ### 用真实 agent SDK 接入
 
 上表是裸 HTTP 发的。换成 agent 实际用的官方 `openai` SDK，客户端代码**一字不差**，
-只有 `model=` 里的 provider 名不同：
+连 `model=` 都不用换 —— 两趟之间变的只有本地 magpie 那个开关：
 
 ```python
 client = OpenAI(base_url="http://127.0.0.1:3425/v1", api_key="magpie")
-stream = client.chat.completions.create(model="plain/<upstream>", messages=…, stream=True)
-stream = client.chat.completions.create(model="tail/<upstream>",  messages=…, stream=True)
+stream = client.chat.completions.create(model="peer/<upstream>", messages=…, stream=True)
+# magpie plugin builtin on tail   ← 同一个 client、同一个 model，只翻这一个开关
+stream = client.chat.completions.create(model="peer/<upstream>", messages=…, stream=True)
 ```
 
 8 轮、82 KB → 219 KB、25 Mbps 实测：plain 1.18 MB / 0.49 s，tail 0.22 MB / 0.08 s
 （5.4x，省 0.41 s），第 2 轮起 tail 每轮固定 20.2 KB / 6.7 ms。
 
-复跑：
+复跑（`--magpie` 指向带 tail 的二进制，例如 `-o /tmp/magpie-panel` 构建出来的那个）：
 
 ```bash
-# magpie 侧：go build -tags nogui -o /tmp/magpie-tail .
-python -m tools.magpie_native --magpie /tmp/magpie-tail --rounds 10      # 纯追加,只测字节
-python -m tools.realworld --magpie /tmp/magpie-tail --rounds 20 --mbps 25 \
+python -m tools.magpie_native --magpie /tmp/magpie-panel --rounds 10     # 纯追加,只测字节
+python -m tools.realworld --magpie /tmp/magpie-panel --rounds 20 --mbps 25 \
     --compact-every 10 --branch-every 7 --sessions 2 --turn-kb 24 --system-kb 40
-python -m tools.agent_sdk  --magpie /tmp/magpie-tail --rounds 8 --mbps 25  # 真实 openai SDK
+python -m tools.agent_sdk  --magpie /tmp/magpie-panel --rounds 8 --mbps 25  # 真实 openai SDK
 ```
 
 ### 不改 magpie 的部署方式（旁路代理）
@@ -538,8 +550,8 @@ python -m tail.proxy --upstream http://10.0.0.5:8765 --port 8766
 | 工具 | 跑的是什么 | 用来回答 |
 | --- | --- | --- |
 | `tools/magpie_pair.py` | 两个角色都是 Python 实现，进程内 | 协议本身对不对、字节省多少 |
-| `tools/magpie_live.py` | 旁路代理 + 两个**真实 magpie** | 不改 magpie 时的字节对比 |
-| `tools/magpie_native.py` | 两个**真实 magpie**，magpie 源码自带 tail | magpie 原生实现省多少字节 |
+| `tools/magpie_live.py` | 旁路代理（Python 的 `tail.serve`/`tail.proxy`）+ 两个**真实 magpie**（magpie 自己的 tail 插件关掉） | 不改 magpie 时的字节对比 |
+| `tools/magpie_native.py` | 两个**真实 magpie**，magpie 源码自带 tail；同一个 provider，插件 off/on 两趟 | magpie 原生实现省多少字节 |
 | `tools/realworld.py` | 同上，但轨迹含 compact/分支/多会话，**链路按带宽限速** | 真实场景下省多少**时间** |
 | `tools/agent_sdk.py` | 同上，客户端换成官方 `openai` SDK | 接到 agent 上有没有区别 |
 | `tools/hardcases.py` | 同上，但故意制造并发 / 乱序响应 / 网关重启 | 不理想条件下会不会串台、悄悄退化 |

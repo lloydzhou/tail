@@ -8,18 +8,20 @@
 2. **不只是字节**。中间那条 TCP 链路按真实上行带宽限速(``tools/link.py``),
    于是「少传 90% 字节」直接变成「上传快多少」;每个请求的上传耗时是这条连接上
    字节真正传完的时间,不是端到端总时间。
-3. **两条路同一个观测点**。plain(整包 JSON)和 tail(``tail=on``)走同一个中继、
-   同一批请求、同一个上游;推理服务收到的 messages 逐轮对账。
+3. **两条路同一个观测点**。plain(整包 JSON)和 tail(只上行尾巴)是**同一个
+   provider**、同一条中继、同一批请求,只有本地 magpie 那个开关不同;推理服务收到
+   的 messages 逐轮对账。
 
 拓扑::
 
     agent/脚本  ──▶  magpie(本地)  ──▶  限速中继  ──▶  magpie(集群)  ──▶ 推理服务
-                        ├── provider plain:url=…            (MAGPIE_TAIL=1)
-                        └── provider tail :url=… tail=on
+                        └── provider peer:url=…
+                             tail 插件 on  → 只上行尾巴
+                             tail 插件 off → 整包 JSON
 
 用法::
 
-    .venv/bin/python -m tools.realworld --magpie /tmp/magpie-tail \\
+    .venv/bin/python -m tools.realworld --magpie /tmp/magpie-panel \\
         --rounds 24 --mbps 25 --compact-every 8 --branch-every 6 --sessions 2
 
 ``--mbps 0`` 就是纯回环(只测 CPU 开销),``--mbps 25`` 是一条普通家宽上行。
@@ -52,9 +54,20 @@ from .magpie_pair import Server, _free_port
 # ---------------------------------------------------------------------------
 
 class Magpie:
-    def __init__(self, binary: str, root: str, addr: str, tail: bool = False):
+    """一个真实的 magpie 进程(临时 XDG 目录)。
+
+    tail 传输**只有一个开关**:内置插件 ``tail``(Plugins › Built-in,或
+    ``magpie plugin builtin on|off tail``)。它默认是开的 —— 所有内置插件默认都开
+    —— 而且同时管两件事:接受尾巴请求,以及对「握手说支持」的对端发尾巴。
+
+    所以 plain / tail 不再是两个 provider,而是**同一个 provider 在这一个开关的两
+    个状态**。``switch()`` 写完会等正在跑的那个进程认(轮询它自己的 OPTIONS),
+    因此 A/B 每一次切换都是确定的,不靠 sleep 猜。
+    """
+
+    def __init__(self, binary: str, root: str, addr: str, tail: bool = True):
         self.binary, self.root, self.addr = binary, root, addr
-        self.tail = "1" if tail else ""
+        self.tail = tail            # 想让它处在的状态,start() 之前写进 plugins.yml
         self.proc: Optional[subprocess.Popen] = None
         for d in ("config", "cache"):
             os.makedirs(os.path.join(root, d), exist_ok=True)
@@ -64,21 +77,70 @@ class Magpie:
         e["XDG_CONFIG_HOME"] = os.path.join(self.root, "config")
         e["XDG_CACHE_HOME"] = os.path.join(self.root, "cache")
         e["MAGPIE_ADDR"] = self.addr
-        e["MAGPIE_TAIL"] = self.tail
         return e
 
-    def provider(self, name: str, url: str, model: str, tail: bool) -> None:
+    def cli(self, *args: str) -> subprocess.CompletedProcess:
+        return subprocess.run([self.binary, *args], env=self.env(),
+                              capture_output=True, text=True, timeout=180)
+
+    def switch(self, on: bool, timeout: float = 10.0) -> None:
+        """把 tail 插件翻成 on/off;正在跑的话,等它真的认了这个开关。"""
+        out = self.cli("plugin", "builtin", "on" if on else "off", "tail")
+        if out.returncode != 0:
+            raise RuntimeError(
+                f"plugin builtin {'on' if on else 'off'} tail: "
+                f"{out.stderr or out.stdout}")
+        self.tail = on
+        if self.running():
+            self.until(on, timeout)
+
+    def running(self) -> bool:
+        return self.proc is not None and self.proc.poll() is None
+
+    def tail_on(self) -> Optional[bool]:
+        """这个网关现在是不是开着 tail:问它自己的握手。"""
+        try:
+            r = httpx.request("OPTIONS",
+                              f"http://{self.addr}/v1/chat/completions",
+                              timeout=2)
+        except Exception:                   # noqa: BLE001 — 还没起来
+            return None
+        return bool(r.headers.get("x-tail-version"))
+
+    def until(self, on: bool, timeout: float = 10.0) -> None:
+        """等网关反映开关:插件在 plugins.yml 里改了,进程一秒内会重新加载。"""
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            if self.tail_on() == on:
+                return
+            time.sleep(0.1)
+        raise RuntimeError(
+            f"magpie {self.addr} 的 tail 开关没变成 "
+            f"{'on' if on else 'off'}(现在 {self.tail_on()})")
+
+    def prewarm(self) -> None:
+        """把「对端支不支持」这一问提前问掉,别让它落进被测的那一轮。
+
+        开关刚翻成 on 时本机还不知道对端的答案:第一轮按普通 JSON 发,同时后台问
+        OPTIONS。列模型本身就会问(`tailAskAll`),所以这里列一次再给半秒 ——
+        于是被测的第一轮就已经能发尾巴,而那一问的字节落在 `relay.reset()` 之前。
+        """
+        try:
+            self.models()
+        except Exception:                   # noqa: BLE001 — 预热失败就按原样跑
+            return
+        time.sleep(0.5)
+
+    def provider(self, name: str, url: str, model: str) -> None:
         kv = [f"url={url}", f"key=sk-{name}-test", f"models={model}"]
-        if tail:
-            kv.append("tail=on")
-        out = subprocess.run([self.binary, "provider", "add", name, *kv],
-                             env=self.env(), capture_output=True, text=True,
-                             timeout=180)
+        out = self.cli("provider", "add", name, *kv)
         if out.returncode != 0:
             raise RuntimeError(f"provider add {name}: {out.stderr or out.stdout}")
 
     def start(self, log: Optional[str] = None) -> None:
         """起 serve。传 log 就把 stderr 落到那个文件(调试用)。"""
+        # 起之前先把开关写进 plugins.yml:新进程一启动就是想要的状态
+        self.switch(self.tail)
         err = open(log, "wb") if log else subprocess.DEVNULL
         self.proc = subprocess.Popen([self.binary, "serve"], env=self.env(),
                                      stdout=subprocess.DEVNULL, stderr=err)
@@ -89,6 +151,7 @@ class Magpie:
         while time.time() < deadline:
             try:
                 if httpx.get(url, timeout=2).status_code == 200:
+                    self.until(self.tail)
                     return
             except Exception:                   # noqa: BLE001
                 pass
@@ -101,12 +164,19 @@ class Magpie:
         return [m["id"] for m in r.json()["data"]]
 
     def stop(self) -> None:
-        if self.proc is not None:
+        if self.running():
             self.proc.terminate()
             try:
                 self.proc.wait(timeout=10)
             except subprocess.TimeoutExpired:
                 self.proc.kill()
+        self.proc = None
+
+
+def _switch(m: Magpie) -> str:
+    """打印用:这个网关的 tail 插件现在是 on / off / 还没起来。"""
+    on = m.tail_on()
+    return "on" if on else ("off" if on is False else "?")
 
 
 # ---------------------------------------------------------------------------
@@ -288,7 +358,7 @@ def main() -> None:
         print(f"轨迹:{len(trace)} 轮,{trace.sessions} 个会话,事件 {trace.kinds()}")
 
         cluster.provider("mock", f"http://127.0.0.1:{backend_port}/v1",
-                         "deepseek-chat", tail=False)
+                         "deepseek-chat")
         cluster.start()
         cluster.wait()
         cluster_model = [m for m in cluster.models() if m.startswith("mock/")][0]
@@ -300,21 +370,24 @@ def main() -> None:
         peer = f"http://127.0.0.1:{relay.port}/v1"
         print(f"链路:{args.mbps or '不限速'} Mbps 上行,连接在 127.0.0.1:{relay.port}")
 
+        # 本地 magpie:只要一个 provider。plain 和 tail 是**同一个 provider**,区别
+        # 只在本地这台网关的 tail 插件开关(下面两趟各翻一次)。
         local = Magpie(args.magpie, os.path.join(root, "local"),
-                       f"127.0.0.1:{_free_port()}")
-        local.provider("plain", peer, cluster_model, tail=False)
-        local.provider("tail", peer, cluster_model, tail=True)
+                       f"127.0.0.1:{_free_port()}", tail=False)
+        local.provider("peer", peer, cluster_model)
         local.start()
         local.wait()
-        models = local.models()
-        plain_model = [m for m in models if m.startswith("plain/")][0]
-        tail_model = [m for m in models if m.startswith("tail/")][0]
+        model = [m for m in local.models() if m.startswith("peer/")][0]
         url = f"http://{local.addr}/v1/chat/completions"
+        print(f"本地 magpie {local.addr}:{model},"
+              f"tail 插件 {_switch(local)},集群 {_switch(cluster)}")
 
-        print("\n[1/2] plain…")
-        plain = run_pass(url, plain_model, trace, relay, args.stream)
-        print("[2/2] tail…")
-        tail = run_pass(url, tail_model, trace, relay, args.stream)
+        print("\n[1/2] plain:本地网关的 tail 插件 **关**(整包 JSON)…")
+        plain = run_pass(url, model, trace, relay, args.stream)
+        local.switch(True)          # 唯一要翻的东西:同一个 provider,只换开关
+        local.prewarm()             # 把「对端支不支持」那一问提前问掉
+        print("[2/2] tail:同一个 provider,tail 插件 **开**…")
+        tail = run_pass(url, model, trace, relay, args.stream)
 
         # 保真:两条路到推理服务的消息必须逐轮一致
         seen = backend.state.received[-(2 * len(trace)):]
@@ -322,7 +395,7 @@ def main() -> None:
             for i, (a, b) in enumerate(zip(seen[:len(trace)], seen[len(trace):])):
                 if a["messages"] != b["messages"]:
                     raise AssertionError(f"第 {i + 1} 轮:两条路到达推理服务的消息不一致")
-            print("\n两条路到达推理服务的 messages 逐轮一致 ✓")
+            print("\n两趟(开关关 / 开关开)到达推理服务的 messages 逐轮一致 ✓")
 
         result = report(plain, tail, args.mbps, trace.kinds())
         if args.json_out:
