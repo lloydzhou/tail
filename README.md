@@ -515,17 +515,18 @@ python -m tail.serve --backend http://127.0.0.1:3425 --port 8765 \
 python -m tail.proxy --upstream http://10.0.0.5:8765 --port 8766
 ```
 
-`tail/proxy.py` 是同协议的客户端侧参考实现，握手、降级都在里面（`--native` 切换成
-纯转发做基线，`--no-handshake` 退回不问就发的旧行为）。`tail/serve.py` 与它对话时，
-第一轮整包、后台问一次 `OPTIONS`，第二轮起换成尾巴——不需要任何配置。
+`tail/proxy.py` 是同协议的客户端侧参考实现，握手、降级都在里面。`tail/serve.py` 与它
+对话时，第一轮整包、后台问一次 `OPTIONS`，第二轮起换成尾巴——不需要任何配置，也没有
+「基线开关」这种东西：基线就是 magpie 发来的那份 JSON 本身，代理的 `/__tail/stats`
+同时记着它（`json_bytes_in`）和自己实际发出去的字节（`wire_bytes_out`）。
 
 ### 取数工具一览
 
 | 工具 | 跑的是什么 | 用来回答 |
 | --- | --- | --- |
 | `tools/handshake_live.py` | **真的起进程**：`tail.serve` + `tail.proxy`，对端分别答 OPTIONS / 只吃 JSON / 假装支持再反悔 | 握手是不是自己就完成了、会不会漏头、会不会坏掉一轮 |
+| `tools/magpie_live.py` | 旁路代理（Python 的 `tail.serve`/`tail.proxy`）+ 一个**真实 magpie**（magpie 自己的 tail 插件关掉） | 不改 magpie 时的字节对比 |
 | `tools/magpie_pair.py` | 两个角色都是 Python 实现，进程内 | 协议本身对不对、字节省多少 |
-| `tools/magpie_live.py` | 旁路代理（Python 的 `tail.serve`/`tail.proxy`）+ 两个**真实 magpie**（magpie 自己的 tail 插件关掉） | 不改 magpie 时的字节对比 |
 | `tools/magpie_native.py` | 两个**真实 magpie**，magpie 源码自带 tail；同一个 provider，插件 off/on 两趟 | magpie 原生实现省多少字节 |
 | `tools/realworld.py` | 同上，但轨迹含 compact/分支/多会话，**链路按带宽限速** | 真实场景下省多少**时间** |
 | `tools/agent_sdk.py` | 同上，客户端换成官方 `openai` SDK | 接到 agent 上有没有区别 |
@@ -602,8 +603,8 @@ OPTIONS /v1/chat/completions
 一次。
 
 `tail/serve.py` 负责宣告，`tail/proxy.py` 负责探测与降级，两边都是默认行为，不需要
-配置。`tail/proxy.py --no-handshake` 可以退回「不问就发」的旧行为，专门用来对照。
-`GET /__tail/stats` 里能看到 `probes`（问过几次）、`plain_requests`（这一轮整包发了
+配置，也没有开关——接一个答不上来的对端，它自己就退回整包，行为与这套传输不存在时
+一致。`GET /__tail/stats` 里能看到 `probes`（问过几次）、`plain_requests`（这一轮整包发了
 几次）、`fallbacks`（说支持却反悔，整包重发了几次）和当下的判断结果 `capability`。
 
 ## 分块与块哈希
@@ -712,7 +713,7 @@ H → block[1773] → parent → block[1772] → ... → block[0] → 链根
 python -m pytest tests/ -v
 ```
 
-130 个测试（含 11 个 Redis 真机用例，连不上 Redis 时自动 skip），覆盖分块与前缀复用、
+125 个测试（含 11 个 Redis 真机用例，连不上 Redis 时自动 skip），覆盖分块与前缀复用、
 渲染确定性、前缀自检、链式存储、Lua 写链/走链/续期、客户端 → ASGI 网关 → mock 上游
 的端到端链路（含 409 降级与恢复）、握手的三种状态与两种降级（`tests/test_handshake.py`），
 以及用真实 `openai` SDK 经 `TailTransport` 接入的回归测试。

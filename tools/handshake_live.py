@@ -8,12 +8,13 @@
         ↑
     各种「对端」:正常 echo、只吃 JSON、假装支持再反悔
 
-四段:
+分四段:
 
 1. 网关宣告:``OPTIONS`` 在 chat 路径答 ``204 + X-Tail-Version + X-Tail-Block``,
    别的路径不答;
 2. 正常链路:第 1 轮整包(还没问过)、握手落定后第 2 轮起换成尾巴,并且
-   ``X-Tail-*`` 一个都不漏给客户端;
+   ``X-Tail-*`` 一个都不漏给客户端;省下的字节按「客户端发来的 JSON」对
+   「代理实际发出去的字节」算;
 3. 只吃 JSON 的对端:一次都不试尾巴,只问一次,之后一直整包;
 4. 假装支持又反悔的对端:整包重发一次把那一轮救回来,然后记成不支持。
 
@@ -255,20 +256,23 @@ def _advertisement(gateway: int) -> None:
                    and headers.get("x-tail-block") == "512")
 
 
-def _normal(tail: int, native: int) -> None:
+def _normal(tail: int) -> None:
     print("\n== 2. 正常链路(对端支持尾巴)==")
     rng = random.Random(5)
     body = _body(2, rng)
     before = _stats(tail)
+    rows = []
     for turn in range(1, 5):
         status, headers, raw = _chat(tail, body)
         time.sleep(0.2)                       # 等后台那一问落定
         now = _stats(tail)
         wire = now["wire_bytes_out"] - before["wire_bytes_out"]
         json_in = now["json_bytes_in"] - before["json_bytes_in"]
-        print(f"  第 {turn} 轮: {status} json={json_in:6d}B wire={wire:6d}B "
-              f"plain={now['plain_requests']} tail={now['tail_requests']} "
-              f"hit={now['hits']} miss={now['misses']} probes={now['probes']}")
+        rows.append((turn, json_in, wire, status))
+        print(f"  第 {turn} 轮: {status} 整包={json_in:6d}B "
+              f"实际上行={wire:6d}B plain={now['plain_requests']} "
+              f"tail={now['tail_requests']} hit={now['hits']} "
+              f"miss={now['misses']} probes={now['probes']}")
         _check(f"第 {turn} 轮成功且不泄露 X-Tail-*",
                status == 200
                and not any(k.lower().startswith("x-tail-") for k in headers))
@@ -286,29 +290,20 @@ def _normal(tail: int, native: int) -> None:
                               "content": f"继续{turn} " + "分析 数据 " * 30}]
 
     caps = _stats(tail)["capability"]
-    _check("能力判断记成支持",
-           list(caps.values()) == ["takes"], str(caps))
+    _check("能力判断记成支持", list(caps.values()) == ["takes"], str(caps))
     _check("第 1 轮之后不再整包", _stats(tail)["plain_requests"] == 1)
 
-    # --native 基线:同一网关、同一批请求、纯转发
-    print("\n  --native 基线(同一网关,同一批请求)")
-    rng = random.Random(5)
-    body = _body(2, rng)
-    for turn in range(1, 5):
-        _chat(native, body)
-        body["messages"] += [{"role": "user",
-                              "content": f"继续{turn} " + "分析 数据 " * 30}]
-    n, t = _stats(native), _stats(tail)
-    print(f"  native: json={n['json_bytes_in']}B wire={n['wire_bytes_out']}B | "
-          f"tail: json={t['json_bytes_in']}B wire={t['wire_bytes_out']}B")
-    _check("tail 的总上行不到整包的一半",
-           t["wire_bytes_out"] * 2 < n["wire_bytes_out"],
-           f"{t['wire_bytes_out']}/{n['wire_bytes_out']}")
+    total_json = sum(r[1] for r in rows)
+    total_wire = sum(r[2] for r in rows)
+    print(f"  合计:整包 {total_json}B → 实际上行 {total_wire}B "
+          f"({total_json / total_wire:.1f}x)")
+    _check("总上行不到整包的一半", total_wire * 2 < total_json,
+           f"{total_wire}/{total_json}")
 
 
-def _no_handshake_answer(mode: str, tag: str, *, flags: tuple = ()) -> None:
+def _peer_pass(mode: str, tag: str) -> Dict:
     peer = _serve_peer(mode)
-    proxy = _proxy(f"http://127.0.0.1:{peer}", *flags, tag=tag)
+    proxy = _proxy(f"http://127.0.0.1:{peer}", tag=tag)
     rng = random.Random(9)
     body = _body(2, rng)
     for turn in range(1, 4):
@@ -330,7 +325,7 @@ def _no_handshake_answer(mode: str, tag: str, *, flags: tuple = ()) -> None:
 
 def _peer_says_no() -> None:
     print("\n== 3. 对端只吃 JSON(答不了 OPTIONS)==")
-    now = _no_handshake_answer("json_only", "proxy-json-only")
+    now = _peer_pass("json_only", "proxy-json-only")
     _check("一次尾巴都没试", now["tail_requests"] == 0 and now["fallbacks"] == 0)
     _check("只问过一次", now["probes"] == 1)
     _check("一直整包", now["plain_requests"] == 3)
@@ -340,7 +335,7 @@ def _peer_says_no() -> None:
 
 def _peer_backpedals() -> None:
     print("\n== 4. 对端说支持、收到尾巴又 415 ==")
-    now = _no_handshake_answer("lying", "proxy-lying")
+    now = _peer_pass("lying", "proxy-lying")
     _check("只降级了一次(那一轮救回来了)", now["fallbacks"] == 1,
            str(now["fallbacks"]))
     _check("降级之后记成不支持", list(now["capability"].values()) == ["refuses"],
@@ -348,26 +343,16 @@ def _peer_backpedals() -> None:
     _check("之后不再试尾巴", now["tail_requests"] == 1, str(now["tail_requests"]))
 
 
-def _blind() -> None:
-    print("\n== 5. --no-handshake(旧行为:不问就发)==")
-    now = _no_handshake_answer("json_only", "proxy-blind", flags=("--no-handshake",))
-    _check("不问 OPTIONS", now["probes"] == 0)
-    _check("靠 415 才发现,每轮降级一次", now["fallbacks"] == 3,
-           str(now["fallbacks"]))
-
-
 def main() -> int:
     echo = _serve_peer("echo")
     gateway = _gateway(f"http://127.0.0.1:{echo}")
     tail = _proxy(f"http://127.0.0.1:{gateway}", tag="proxy-tail")
-    native = _proxy(f"http://127.0.0.1:{gateway}", "--native", tag="proxy-native")
 
     try:
         _advertisement(gateway)
-        _normal(tail, native)
+        _normal(tail)
         _peer_says_no()
         _peer_backpedals()
-        _blind()
     finally:
         for proc in _PROCS:
             proc.terminate()

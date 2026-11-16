@@ -183,24 +183,6 @@ class TestRetransmit:
 
 
 class TestModes:
-    def test_native_mode_forwards_json_untouched(self):
-        """A/B 基线:同一个代理换成纯转发,字节数就是 JSON 本身。"""
-        backend = build_backend_app()
-        app = proxy.build_app("http://backend", native=True)
-        app.state.client = httpx.AsyncClient(
-            transport=httpx.ASGITransport(app=backend), timeout=30)
-        tc = TestClient(app)
-
-        payload = _payload(5, rng=random.Random(21))
-        raw = json.dumps(payload).encode()
-        r = tc.post("/v1/chat/completions", content=raw,
-                    headers={"content-type": "application/json"})
-        assert r.status_code == 200
-        stats = app.state.stats.as_dict()
-        assert stats["native_requests"] == 1
-        assert stats["wire_bytes_out"] == len(raw)
-        assert backend.state.received[-1]["messages"] == payload["messages"]
-
     def test_non_chat_path_is_passed_through(self, chain):
         r = chain.tc.get("/v1/models")
         assert chain.stats.passthrough == 1

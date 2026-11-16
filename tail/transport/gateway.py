@@ -213,10 +213,6 @@ class Capability:
         ttl = self._takes_for if takes else self._no_for
         self._state[key] = (TAKES if takes else REFUSES, self._clock() + ttl)
 
-    def forget(self, key: str) -> None:
-        """忘掉一个答案:对端说了支持却拒了尾巴,或者换了地址。"""
-        self._state.pop(key, None)
-
     def snapshot(self) -> Dict[str, str]:
         """现在还作数的答案(过期的顺手清掉),给人看(``/__tail/stats``)。"""
         live = {k: v for k, v in ((k, self.state(k)) for k in self._state)

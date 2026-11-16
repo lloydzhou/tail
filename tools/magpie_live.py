@@ -1,25 +1,21 @@
-"""真机对比:两个真实 magpie 之间,原生 JSON 上行 vs tail 上行。
+"""真机对比:真实的 magpie 经 Python 旁路代理时,上行省多少字节。
 
 链路(全部是本机进程,但角色和线上一致)::
 
-    ┌────────────┐   两次:一次直连、一次走 tail     ┌────────────┐
-    │ magpie(本地)│──────────────────────────────────▶│ magpie(集群)│──▶ 推理服务
-    └────────────┘   ┌──────────────┐               └────────────┘
-                     │ tail 网关/代理│  ← 只有 tail 那一次经过
-                     └──────────────┘
+    ┌────────────┐         ┌──────────────┐        ┌────────────┐
+    │ magpie(本地)│──JSON──▶│ tail 网关/代理│──尾巴──▶│ magpie(集群)│──▶ 推理服务
+    └────────────┘         └──────────────┘        └────────────┘
 
 - 集群侧:一个真正的 magpie gateway,provider 指向推理服务(这里用 mock 推理服务,
   真实环境换成 api.deepseek.com 之类的 chat completions 上游即可)。
 - 两边的 magpie 都把内置插件 `tail` **关掉**(`magpie plugin builtin off tail`):
   tail 在这条链路里由 Python 的 `tail.serve` / `tail.proxy` 两个进程实现,
   magpie 自己的那套不参与,关掉才量得准。
-- 本地侧:一个真正的 magpie gateway,两个 provider ——
-  ``direct`` 直连集群 magpie,``tail`` 指向本地 tail 代理(再经 tail 网关到集群 magpie)。
-- 两次请求体完全一样,只有 ``model`` 前面的 provider 名不同,所以「magpie 会怎么改写
-  请求」这个变量被消掉了。
+- 本地侧:一个真正的 magpie gateway,provider 指向本地 tail 代理。
 
-测的字节就是**两个 magpie 之间**的字节:直连那一次读本地代理(native 模式,纯转发)
-的计数,tail 那一次读同一个代理的 tail 计数——同一个观测点,可公平对比。
+测的是代理这一侧的账:``json_bytes_in`` 是 magpie 发来的整包 JSON(不开这套传输时
+就是它要上传的字节),``wire_bytes_out`` 是代理实际发出去的字节。同一批请求体上的
+两个数,就是这套传输省下来的量——不需要为了取基线再跑一趟。
 
 用法::
 
@@ -163,11 +159,12 @@ def run_pass(gateway_url: str, model: str, stats, rounds: int,
         after = stats.as_dict() if stats else None
         if stats:
             wire = after["wire_bytes_out"] - before["wire_bytes_out"]
+            json_in = after["json_bytes_in"] - before["json_bytes_in"]
             prep = after["prepare_ms"] - before["prepare_ms"]
             hits = after["hits"] - before["hits"]
         else:
-            wire, prep, hits = result["bytes"], 0.0, 0
-        rows.append({"round": len(rows) + 1, "json_bytes": result["bytes"],
+            wire, json_in, prep, hits = result["bytes"], result["bytes"], 0.0, 0
+        rows.append({"round": len(rows) + 1, "json_bytes": json_in,
                      "wire_bytes": wire, "total_ms": round(result["total_ms"], 1),
                      "prepare_ms": round(prep, 1), "hit": bool(hits)})
     return rows, sent
@@ -199,7 +196,6 @@ def main() -> None:
     backend = build_backend_app()
     backend_port = _free_port()
     gateway_port = _free_port()
-    native_port = _free_port()
     tail_port = _free_port()
     cluster_addr = f"127.0.0.1:{_free_port()}"
     local_addr = f"127.0.0.1:{_free_port()}"
@@ -207,10 +203,8 @@ def main() -> None:
     servers = [Server(backend, backend_port, "mock 推理服务(集群里的上游)")]
     store = storage.MemoryChainStore()
     gateway_app = serve.build_app(f"http://127.0.0.1:{backend_port}", store)
-    native_app = proxy.build_app(f"http://127.0.0.1:{gateway_port}", native=True)
     tail_app = proxy.build_app(f"http://127.0.0.1:{gateway_port}")
     servers.append(Server(gateway_app, gateway_port, "tail 网关(集群侧)"))
-    servers.append(Server(native_app, native_port, "本地代理·纯转发(基线)"))
     servers.append(Server(tail_app, tail_port, "本地代理·tail"))
 
     cluster = Magpie(args.magpie, os.path.join(root, "cluster"), cluster_addr)
@@ -225,67 +219,60 @@ def main() -> None:
         upstream_model = [m for m in cluster.models() if m.startswith("mock/")][0]
         print(f"集群 magpie {cluster_addr} 上游模型 {upstream_model}")
 
-        # 本地 magpie:两个 provider,一个直连、一个走 tail
-        local.provider("direct", f"http://127.0.0.1:{native_port}/v1", upstream_model)
+        # 本地 magpie:provider 指向本地代理
         local.provider("tail", f"http://127.0.0.1:{tail_port}/v1", upstream_model)
         local.start()
         local.wait()
-        local_models = local.models()
-        direct_model = [m for m in local_models if m.startswith("direct/")][0]
-        tail_model = [m for m in local_models if m.startswith("tail/")][0]
-        print(f"本地 magpie {local_addr}: {direct_model} / {tail_model}")
+        tail_model = [m for m in local.models() if m.startswith("tail/")][0]
+        print(f"本地 magpie {local_addr}: {tail_model}")
 
         url = f"http://{local_addr}/v1/chat/completions"
-        print("\n[1/2] 直连(整包 JSON 上行)…")
-        native_rows, native_sent = run_pass(url, direct_model,
-                                            native_app.state.stats, args.rounds,
-                                            args.stream)
-        print("[2/2] tail(只上行尾巴字节)…")
+        print("\n逐轮取字节…")
         store.clear()
         tail_stats = tail_app.state.stats
         tail_stats.reset()
-        tail_rows, tail_sent = run_pass(url, tail_model, tail_stats, args.rounds,
-                                        args.stream)
+        rows, sent = run_pass(url, tail_model, tail_stats, args.rounds, args.stream)
 
-        # —— 保真:两条路在推理服务那里必须看到同一串消息 ——
-        received = backend.state.received[-2 * args.rounds:]
-        if len(received) >= 2 * args.rounds:
-            a, b = received[:args.rounds], received[args.rounds:]
-            for i, (x, y) in enumerate(zip(a, b)):
-                if x["messages"] != y["messages"]:
-                    raise AssertionError(f"第 {i + 1} 轮:直连与 tail 到达推理服务的消息不一致")
+        # —— 保真:推理服务收到的 messages 必须是 magpie 发出来的那串 ——
+        received = backend.state.received[-args.rounds:]
+        if len(received) >= args.rounds:
+            for i, (want, got) in enumerate(zip(sent, received)):
+                if want != got["messages"]:
+                    raise AssertionError(
+                        f"第 {i + 1} 轮:推理服务收到的 messages 与发出来的不一致")
 
         print()
-        print("=" * 92)
-        print(f"{'轮':>3} {'JSON上行':>10} {'直连耗时':>10} {'tail上行':>11} "
-              f"{'tail耗时':>10} {'代理准备':>9} {'省':>7}")
-        print(f"{'':>3} {'(KB)':>10} {'(ms)':>10} {'(KB)':>11} {'(ms)':>10} "
-              f"{'(ms)':>9} {'(倍)':>7}")
-        print("-" * 92)
-        for a, b in zip(native_rows, tail_rows):
-            ratio = a["wire_bytes"] / b["wire_bytes"] if b["wire_bytes"] else 0
-            print(f"{a['round']:>3} {_kb(a['wire_bytes']):>10} {a['total_ms']:>10.1f} "
-                  f"{_kb(b['wire_bytes']):>11} {b['total_ms']:>10.1f} "
-                  f"{b['prepare_ms']:>9.1f} {ratio:>6.1f}x")
-        print("-" * 92)
-        nw = sum(r["wire_bytes"] for r in native_rows)
-        tw = sum(r["wire_bytes"] for r in tail_rows)
+        print("=" * 78)
+        print(f"{'轮':>3} {'整包 JSON':>12} {'tail 上行':>12} {'省':>7} "
+              f"{'tail耗时':>10} {'代理准备':>9}")
+        print(f"{'':>3} {'(KB)':>12} {'(KB)':>12} {'(倍)':>7} {'(ms)':>10} "
+              f"{'(ms)':>9}")
+        print("-" * 78)
+        for r in rows:
+            ratio = r["json_bytes"] / r["wire_bytes"] if r["wire_bytes"] else 0
+            print(f"{r['round']:>3} {_kb(r['json_bytes']):>12} "
+                  f"{_kb(r['wire_bytes']):>12} {ratio:>6.1f}x "
+                  f"{r['total_ms']:>10.1f} {r['prepare_ms']:>9.1f}")
+        print("-" * 78)
+        total_json = sum(r["json_bytes"] for r in rows)
+        total_wire = sum(r["wire_bytes"] for r in rows)
         stats = tail_stats.as_dict()
-        print(f"合计 {args.rounds} 轮:直连 {_mb(nw)} MB,tail {_mb(tw)} MB,"
-              f"体积 {nw / tw:.1f}x;代理侧准备均摊 {stats['prepare_ms'] / args.rounds:.2f} ms/轮")
-        print("两条路在推理服务侧收到的 messages 逐轮一致 ✓")
+        print(f"合计 {args.rounds} 轮:整包 {_mb(total_json)} MB,tail "
+              f"{_mb(total_wire)} MB,体积 {total_json / total_wire:.1f}x;"
+              f"代理侧准备均摊 {stats['prepare_ms'] / args.rounds:.2f} ms/轮")
+        print("推理服务侧收到的 messages 逐轮一致 ✓")
 
         if args.json_out:
             with open(args.json_out, "w") as f:
                 json.dump({"magpie": args.magpie, "rounds": args.rounds,
-                           "native": native_rows, "tail": tail_rows,
-                           "totals": {"native_bytes": nw, "tail_bytes": tw,
-                                      "ratio": round(nw / tw, 2)}},
+                           "rows": rows,
+                           "totals": {"json_bytes": total_json,
+                                      "tail_bytes": total_wire,
+                                      "ratio": round(total_json / total_wire, 2)}},
                           f, ensure_ascii=False, indent=2)
             print(f"已写 {args.json_out}")
     finally:
-        tail_proc = [cluster, local]
-        for m in tail_proc:
+        for m in (cluster, local):
             m.stop()
         for s in servers:
             s.stop()

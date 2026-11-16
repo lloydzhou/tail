@@ -23,9 +23,6 @@
    支持就一直整包发 JSON,而且这一问从不在请求路径上等(见 ``gateway.Capability``);
    对端说了支持却把尾巴当无关 JSON 拒掉时,整包重发一次并把它记成不支持。
 
-``--native`` 模式:不做任何 tail 变换,只做纯转发。用来在同一台机器、同一条链路上
-跑 A/B 基线(原生 JSON 上行 vs tail 上行)。
-
 为什么不把这段直接写进 magpie:magpie 是 Go,入口请求体在中间件之前就被读完、出口没有
 可插的 ``RoundTripper``,所以线缆层面的省必须改它的 Go 源码。本代理是同协议的参考实现,
 也是真机取数的部署件;日后翻成 Go 时,行为以这里为准。
@@ -91,7 +88,6 @@ class Stats:
     def __init__(self) -> None:
         self.requests = 0
         self.tail_requests = 0
-        self.native_requests = 0
         self.passthrough = 0
         self.json_bytes_in = 0      # magpie 发给本代理的
         self.wire_bytes_out = 0     # 本代理发往集群的(含固定头开销)
@@ -113,7 +109,6 @@ class Stats:
         return {
             "requests": self.requests,
             "tail_requests": self.tail_requests,
-            "native_requests": self.native_requests,
             "passthrough": self.passthrough,
             "json_bytes_in": self.json_bytes_in,
             "wire_bytes_out": self.wire_bytes_out,
@@ -129,23 +124,15 @@ class Stats:
         }
 
 
-def build_app(upstream: str,
-              native: bool = False,
-              timeout: float = 600.0,
-              handshake: bool = True) -> FastAPI:
+def build_app(upstream: str, timeout: float = 600.0) -> FastAPI:
     """构造本地代理。
 
     Args:
       upstream: 对端 tail 网关的 base URL(例如 ``http://10.0.0.5:8765``)
-      native: True 时不走 tail,纯转发 JSON(A/B 基线)
       timeout: 上游超时(秒)
-      handshake: True(默认)时先问对端支不支持尾巴,不知道/不支持就整包发;
-        False 是旧行为——假定对端支持,直接把尾巴发出去(对照用)
     """
     app = FastAPI(title="Tail Client Proxy")
     app.state.upstream = upstream.rstrip("/")
-    app.state.native = native
-    app.state.handshake = handshake
     app.state.tail = TailClient()
     app.state.stats = Stats()
     app.state.client = httpx.AsyncClient(timeout=timeout)
@@ -160,9 +147,7 @@ def build_app(upstream: str,
 
     @app.get("/healthz")
     async def healthz():
-        return {"ok": True, "upstream": app.state.upstream,
-                "native": app.state.native,
-                "handshake": app.state.handshake}
+        return {"ok": True, "upstream": app.state.upstream}
 
     @app.api_route("/{path:path}", methods=["GET", "POST"])
     async def proxy(path: str, request: Request):
@@ -180,12 +165,6 @@ async def _handle(request: Request, path: str, app: FastAPI):
 
     raw = await request.body()
 
-    # native 基线:纯转发;非 chat 路径也纯转发
-    if app.state.native:
-        stats.native_requests += 1
-        stats.json_bytes_in += len(raw)
-        stats.wire_bytes_out += len(raw)
-        return await _forward_raw(client, upstream + path, request, raw)
     if not _is_chat(path, request.headers):
         stats.passthrough += 1
         return await _forward_raw(client, upstream + path, request, raw)
@@ -201,7 +180,7 @@ async def _handle(request: Request, path: str, app: FastAPI):
 
     # 尾巴不是 JSON,所以先问对端接不接得住。三种状态里只有「支持」才发尾巴,
     # 而且这一问永远不在请求路径上等:不知道就整包发这一轮,问题挂到后台。
-    if app.state.handshake and not caps.takes(url):
+    if not caps.takes(url):
         if not caps.refuses(url):
             _ask_later(app, url)
         stats.plain_requests += 1
@@ -249,10 +228,9 @@ def _loads(raw: bytes) -> Optional[Dict[str, Any]]:
 
 async def _forward_raw(client: httpx.AsyncClient, url: str,
                        request: Request, raw: bytes) -> Response:
-    """非 chat 路径 / 非法 JSON / native 模式:body 一个字节都不改。
+    """非 chat 路径 / 非法 JSON / 还没问到答案:body 一个字节都不改。
 
-    响应头照样过滤:``X-Tail-*`` 是两侧之间的内部头,在这个模式里也不漏给上层
-    (``--native`` 只是「不发尾巴」,不是「换一个实现」)。
+    响应头照样过滤:``X-Tail-*`` 是两侧之间的内部头,不往上层漏。
     """
     headers = _fwd_headers(request, request.headers.get("content-type")
                            or "application/json")
@@ -385,15 +363,10 @@ def main(argv=None) -> None:
                         help="集群侧 tail 网关 base URL,例如 http://10.0.0.5:8765")
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=8766)
-    parser.add_argument("--native", action="store_true",
-                        help="不做 tail 变换,纯转发(A/B 基线)")
-    parser.add_argument("--no-handshake", action="store_true",
-                        help="不问对端支不支持,直接发尾巴(旧行为,对照用)")
     parser.add_argument("--log-level", default="info")
     args = parser.parse_args(argv)
 
-    app = build_app(args.upstream, native=args.native,
-                    handshake=not args.no_handshake)
+    app = build_app(args.upstream)
     import uvicorn
     uvicorn.run(app, host=args.host, port=args.port, log_level=args.log_level)
 

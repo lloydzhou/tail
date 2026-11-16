@@ -119,8 +119,8 @@ def _supporting_gateway() -> FastAPI:
     return app
 
 
-def _proxy_over(upstream_app: FastAPI, **kwargs) -> FastAPI:
-    app = proxy.build_app("http://upstream", **kwargs)
+def _proxy_over(upstream_app: FastAPI) -> FastAPI:
+    app = proxy.build_app("http://upstream")
     app.state.client = httpx.AsyncClient(
         transport=httpx.ASGITransport(app=upstream_app), timeout=30)
     return app
@@ -253,12 +253,6 @@ class TestCapability:
         assert caps.takes("a") is True
         assert caps.takes("b") is False
 
-    def test_forget_goes_back_to_unknown(self):
-        caps = gw.Capability(clock=_Clock())
-        caps.set("u", True)
-        caps.forget("u")
-        assert caps.state("u") == gw.UNKNOWN
-
     def test_snapshot_only_shows_live_answers(self):
         clock = _Clock()
         caps = gw.Capability(clock=clock)
@@ -348,17 +342,6 @@ class TestHandshakeOnTheWayOut:
         assert stats["probes"] == 1               # 问过一次,记住「不支持」
         assert stats["wire_bytes_out"] == stats["json_bytes_in"]
 
-    def test_a_peer_that_changes_its_mind_is_asked_again(self):
-        """「不支持」只信 5 分钟:对端升级后就该重新用上尾巴。"""
-        app = _proxy_over(_json_only_backend())
-        payload = _payload(2)
-        _fire(app, payload)
-        assert app.state.caps.refuses("http://upstream" + CHAT) is True
-
-        app.state.caps.forget("http://upstream" + CHAT)   # 相当于 TTL 到期
-        _fire(app, payload, times=2)
-        assert app.state.stats.probes == 2
-
     def test_a_peer_that_says_yes_then_refuses_falls_back(self):
         """嘴上说支持、真收到尾巴却 415:整包重发一次,这一轮照样成功。"""
         app = _proxy_over(_lying_backend())
@@ -388,20 +371,6 @@ class TestHandshakeOnTheWayOut:
         assert stats["fallbacks"] == 0            # 没有多打一次
         assert app.state.caps.takes("http://upstream" + CHAT) is True
 
-    def test_no_handshake_is_the_old_blind_behaviour(self):
-        """--no-handshake 不问就发:照样能用,但靠 415 才发现对端不吃。"""
-        app = _proxy_over(_json_only_backend(), handshake=False)
-        payload = _payload(2)
-
-        r, = _fire(app, payload)
-
-        assert r.status_code == 200
-        stats = app.state.stats.as_dict()
-        assert stats["probes"] == 0
-        assert stats["tail_requests"] == 1
-        assert stats["fallbacks"] == 1
-        assert stats["plain_requests"] == 1
-
     def test_the_plain_turn_hides_the_wire_headers(self):
         """第 1 轮整包发,对端应答里的 X-Tail-* 也不能漏给客户端。"""
         app = _proxy_over(_supporting_gateway())
@@ -409,16 +378,9 @@ class TestHandshakeOnTheWayOut:
         assert r.status_code == 200
         assert not [k for k in r.headers if k.lower().startswith("x-tail-")]
 
-    def test_the_native_baseline_hides_them_too(self):
-        """--native 只是「不发尾巴」,不是换一个实现。"""
-        app = _proxy_over(_supporting_gateway(), native=True)
-        r, = _fire(app, _payload(2))
-        assert r.status_code == 200
-        assert not [k for k in r.headers if k.lower().startswith("x-tail-")]
-
     def test_stats_report_the_handshake(self):
         app = _proxy_over(_supporting_gateway())
         _fire(app, _payload(2))
-        health = TestClient(app).get("/healthz").json()
-        assert health["handshake"] is True
-        assert health["native"] is False
+        stats = TestClient(app).get("/__tail/stats").json()
+        assert stats["probes"] == 1
+        assert list(stats["capability"].values()) == ["takes"]
