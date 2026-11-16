@@ -2,6 +2,13 @@
 
 v3 线缆
 -------
+握手(客户端在第一次发尾巴之前问,不在请求路径上等)::
+
+    OPTIONS <chat 路径>            # 就是请求自己要 POST 的那个 URL
+    -> 204  Allow: POST, OPTIONS
+            X-Tail-Version: 3
+            X-Tail-Block: 512      # 通告块大小
+
 请求::
 
     POST /v1/chat/completions
@@ -27,6 +34,7 @@ v3 线缆
 from __future__ import annotations
 
 import json
+import time
 from typing import Any, Dict, Iterable, Iterator, Optional, Tuple
 
 from . import chunking, render
@@ -39,10 +47,17 @@ CONTENT_TYPE_BLOCKS = "application/x-tail-v3"
 TAIL_VERSION = "3"
 
 HEADER_VERSION = "X-Tail-Version"
+#: 握手应答里通告的块大小。两个实现块大小不一致就永远命不中,所以显式广告。
+HEADER_BLOCK = "X-Tail-Block"
 HEADER_STATUS = "X-Tail-Status"
 HEADER_HIT = "X-Tail-Hit"
 HEADER_RETRANSMIT = "X-Tail-Retransmit"
 HEADER_HAVE = "X-Tail-Have"
+
+#: 「支持」和「不支持」各信多久(秒)。不支持的短一些:今天升级的对端今天就能用上。
+#: 这是 v3 的建议值,任何实现照它调就行;两个方向都不影响正确性,只影响多久发现变化。
+TAKES_FOR_SECONDS = 30 * 60
+NO_FOR_SECONDS = 5 * 60
 
 CACHE_HIT = "hit"
 CACHE_MISS = "miss"
@@ -120,6 +135,94 @@ class TailClient:
     @property
     def credential_bytes(self) -> int:
         return self._encoder.credential_bytes
+
+
+# ---------------------------------------------------------------------------
+# 握手:对端到底接不接得住「不是 JSON 的 body」
+# ---------------------------------------------------------------------------
+
+def handshake_headers(block_size: int = chunking.BLOCK_SIZE) -> Dict[str, str]:
+    """OPTIONS 应答的头:这个端点接受什么。
+
+    只有 ``X-Tail-Version`` 和 ``X-Tail-Block`` 都对上才算「支持」——块大小
+    写进应答就是为了不让两边在块边界上各说各话(见 :func:`takes_blocks`)。
+    """
+    return {
+        "allow": "POST, OPTIONS",
+        HEADER_VERSION: TAIL_VERSION,
+        HEADER_BLOCK: str(block_size),
+    }
+
+
+def takes_blocks(headers, block_size: int = chunking.BLOCK_SIZE) -> bool:
+    """一个 OPTIONS 应答是不是「这个端点接受尾巴」。
+
+    应答里版本和块大小都对上才算;其余一律算不支持:4xx/5xx(只收 POST 的
+    405/501、没这条路由的 404、在登录之后的 401)、200 但没带这两个头(代答的
+    代理)、版本或块大小不同。判错成「不支持」只损失一份优化,判错成「支持」
+    会毁掉一整轮,所以门槛只能设得这么严。
+    """
+    if headers is None:
+        return False
+    version = (headers.get(HEADER_VERSION) or "").strip()
+    block = (headers.get(HEADER_BLOCK) or "").strip()
+    return version == TAIL_VERSION and block == str(block_size)
+
+
+#: 三态。只有 ``TAKES`` 才发尾巴。
+UNKNOWN = "unknown"
+TAKES = "takes"
+REFUSES = "refuses"
+
+
+class Capability:
+    """每个对端支不支持尾巴,问一次信一阵子。
+
+    客户端**从不在请求路径上等这个答案**:``UNKNOWN`` 就整包发 JSON,后台问一次
+    (问的是请求自己要 POST 的那个 URL,不新造路径);``TAKES`` 发尾巴,信
+    :data:`TAKES_FOR_SECONDS`;``REFUSES`` 一直整包,信 :data:`NO_FOR_SECONDS`
+    之后再问——早先升级的对端不该永远被当成旧的。
+
+    ``clock`` 可注入,方便测试把时间拨快。
+    """
+
+    def __init__(self, takes_for: float = TAKES_FOR_SECONDS,
+                 no_for: float = NO_FOR_SECONDS, clock=None) -> None:
+        self._takes_for = takes_for
+        self._no_for = no_for
+        self._clock = clock or time.monotonic
+        #: 对端 URL → (状态, 过期时刻)
+        self._state: Dict[str, Tuple[str, float]] = {}
+
+    def state(self, key: str) -> str:
+        """现在认为对端是什么状态(过期的答案按 ``UNKNOWN``)。"""
+        got = self._state.get(key)
+        if got is None:
+            return UNKNOWN
+        state, until = got
+        return state if self._clock() < until else UNKNOWN
+
+    def takes(self, key: str) -> bool:
+        return self.state(key) == TAKES
+
+    def refuses(self, key: str) -> bool:
+        return self.state(key) == REFUSES
+
+    def set(self, key: str, takes: bool) -> None:
+        """记下一个答案。没应答的(超时)也走这里,按不支持记。"""
+        ttl = self._takes_for if takes else self._no_for
+        self._state[key] = (TAKES if takes else REFUSES, self._clock() + ttl)
+
+    def forget(self, key: str) -> None:
+        """忘掉一个答案:对端说了支持却拒了尾巴,或者换了地址。"""
+        self._state.pop(key, None)
+
+    def snapshot(self) -> Dict[str, str]:
+        """现在还作数的答案(过期的顺手清掉),给人看(``/__tail/stats``)。"""
+        live = {k: v for k, v in ((k, self.state(k)) for k in self._state)
+                if v != UNKNOWN}
+        self._state = {k: self._state[k] for k in live}
+        return live
 
 
 # ---------------------------------------------------------------------------

@@ -11,6 +11,10 @@
 但响应头里会多一个下一轮的 ``X-Tail-Have``。
 
 也接受普通 ``application/json`` 请求,原样转发——便于灰度对比和排障。
+
+握手:客户端在第一次发尾巴之前会问一次 ``OPTIONS <chat 路径>``,本服务答
+``204`` + ``X-Tail-Version`` + ``X-Tail-Block``,宣告自己接受 v3 的请求体。
+没带版本号的应答意味着「这里只吃 JSON」,客户端据此一直发整包。
 """
 
 from __future__ import annotations
@@ -53,6 +57,16 @@ def build_app(backend: str,
     app.state.gateway = gw.TailGateway(app.state.storage)
     app.state.backend = backend.rstrip("/")
     app.state.client = httpx.AsyncClient(timeout=timeout)
+
+    # 握手先注册:两条 chat 路径都答(带不带 /v1),其余路径的 OPTIONS 仍然是 405——
+    # 那些路径本来就不吃尾巴,不该广告
+    @app.api_route("/v1/chat/completions", methods=["OPTIONS"])
+    async def handshake_v1():
+        return Response(status_code=204, headers=gw.handshake_headers())
+
+    @app.api_route("/chat/completions", methods=["OPTIONS"])
+    async def handshake_bare():
+        return Response(status_code=204, headers=gw.handshake_headers())
 
     @app.api_route("/v1/chat/completions", methods=["POST"])
     async def chat_completions(request: Request):
@@ -314,8 +328,9 @@ def main(argv: Optional[list] = None) -> None:
                         help="上游 base URL,例如 https://api.deepseek.com")
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=8765)
-    parser.add_argument("--redis", required=True,
-                        help="Redis URL,例如 redis://127.0.0.1:6379/0(唯一存储后端)")
+    parser.add_argument("--redis", default="",
+                        help="Redis URL,例如 redis://127.0.0.1:6379/0(生产用这个);"
+                             "留空则用进程内存储,重启即丢,只适合开发")
     parser.add_argument("--ttl", type=int, default=1800,
                         help="块过期秒数(默认 1800;读前缀时整条续期)")
     parser.add_argument("--log-level", default="info")

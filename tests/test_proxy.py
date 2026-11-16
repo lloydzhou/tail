@@ -69,6 +69,9 @@ def chain():
     proxy_app = proxy.build_app("http://gateway")
     proxy_app.state.client = httpx.AsyncClient(
         transport=httpx.ASGITransport(app=gw_app), timeout=30)
+    # 这两条路径的对端是上面那个网关,它答 OPTIONS;这里直接记成「支持」,
+    # 免得每条断言都先等一次后台握手(握手本身见 test_handshake.py)
+    proxy_app.state.caps.set("http://gateway/v1/chat/completions", True)
 
     tc = TestClient(proxy_app)
     return SimpleNamespace(tc=tc, backend=backend, gw=gw_app,
